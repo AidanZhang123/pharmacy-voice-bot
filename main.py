@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 
+# Debug startup: verify environment variables are loaded
+print(
+    "Startup: ELEVENLABS_API_KEY set?", os.getenv("ELEVENLABS_API_KEY") is not None,
+    "VOICE_ID:", os.getenv("ELEVENLABS_VOICE_ID")
+)
+
 # ─── CORS (allow React dev server) ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
