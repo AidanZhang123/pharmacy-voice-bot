@@ -1,0 +1,24 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+env/
+venv/
+
+# SQLite databases
+*.db
+*.sqlite3
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# Generated TTS MP3s
+static/*.mp3
+
+# IDE/editor folders (optional)
+.vscode/
+.idea/
