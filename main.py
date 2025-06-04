@@ -25,7 +25,7 @@ print(
 # ─── CORS (allow React dev server) ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # adjust if your dashboard domain differs
+    allow_origins=["http://localhost:3000"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -34,8 +34,8 @@ app.add_middleware(
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY   = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID             = os.getenv("ELEVENLABS_VOICE_ID")
-BASE_URL             = os.getenv("BASE_URL")            # e.g. "https://abcd1234.ngrok-free.app"
-GOOGLE_MAPS_API_KEY  = os.getenv("GOOGLE_MAPS_API_KEY") # for geocoding & Places lookups
+BASE_URL             = os.getenv("BASE_URL")
+GOOGLE_MAPS_API_KEY  = os.getenv("GOOGLE_MAPS_API_KEY")
 
 # ─── Initialize OpenAI client ───────────────────────────────────────────────────
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -97,9 +97,6 @@ def init_db():
         print(f"[{datetime.utcnow()}] init_db error: {e}")
 
 def retry_sqlite(func, *args, retries=3, delay=0.1, **kwargs):
-    """
-    Retry a SQLite operation up to `retries` times if the database is locked.
-    """
     for _ in range(retries):
         try:
             return func(*args, **kwargs)
@@ -112,9 +109,6 @@ def retry_sqlite(func, *args, retries=3, delay=0.1, **kwargs):
     return func(*args, **kwargs)
 
 def get_history(call_sid: str):
-    """
-    Fetch (or create) the JSON‐serialized conversation for this call_sid.
-    """
     def _get():
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -138,9 +132,6 @@ def get_history(call_sid: str):
     return retry_sqlite(_get)
 
 def save_history(call_sid: str, messages: list):
-    """
-    Save the updated JSON‐serialized conversation back to SQLite.
-    """
     serialized = json.dumps(messages)
     def _save():
         try:
@@ -157,9 +148,6 @@ def save_history(call_sid: str, messages: list):
     retry_sqlite(_save)
 
 def get_reprompt_count(call_sid: str) -> int:
-    """
-    Return how many times we've reprompted for silence so far.
-    """
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -172,9 +160,6 @@ def get_reprompt_count(call_sid: str) -> int:
         return 0
 
 def increment_reprompt_count(call_sid: str):
-    """
-    Add 1 to the reprompt_count for this call_sid.
-    """
     def _inc():
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -191,9 +176,6 @@ def increment_reprompt_count(call_sid: str):
     retry_sqlite(_inc)
 
 def reset_reprompt_count(call_sid: str):
-    """
-    Reset reprompt_count back to 0 (e.g. after the user speaks successfully).
-    """
     def _reset():
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -213,9 +195,6 @@ def log_call_turn(call_sid: str, turn_number: int,
                   user_text: str=None,
                   assistant_reply: str=None,
                   error_message: str=None):
-    """
-    Insert a row into call_logs for analytics/tracking.
-    """
     def _log():
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -232,9 +211,6 @@ def log_call_turn(call_sid: str, turn_number: int,
     retry_sqlite(_log)
 
 def save_booking(call_sid: str, vaccine_type: str, patient_name: str, desired_date: str):
-    """
-    Insert a completed vaccine booking into the bookings table.
-    """
     def _insert():
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -253,10 +229,6 @@ init_db()
 
 # ─── Utility: Classify intents (VACCINE, REFILL, HOURS, NEAREST, GENERAL) ─────
 def classify_intent(text: str) -> str:
-    """
-    Very basic keyword‐based intent classification.
-    Returns: "VACCINE", "REFILL", "HOURS", "NEAREST", or "GENERAL".
-    """
     lower = text.lower()
     if any(kw in lower for kw in ["vaccine", "shot", "vaccination", "schedule a vaccine"]):
         return "VACCINE"
@@ -270,10 +242,6 @@ def classify_intent(text: str) -> str:
 
 # ─── Helper: Generate ElevenLabs TTS MP3 and return a <Play> TwiML response ────
 def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> VoiceResponse:
-    """
-    Use ElevenLabs to generate an MP3 for `text`, save to static/,
-    then return a VoiceResponse that <Play>s that file inside a <Gather>.
-    """
     tts_filename = f"tts_{call_sid}_{suffix}_{int(time.time())}.mp3"
     tts_filepath = os.path.join("static", tts_filename)
 
@@ -283,7 +251,6 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
         "VOICE_ID:", VOICE_ID
     )
 
-    # Call ElevenLabs TTS
     try:
         tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
         headers = {
@@ -292,7 +259,7 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
         }
         payload = {
             "text": text,
-            "model_id": "eleven_monolingual_v1",
+            "model_id": "eleven_multilingual_v2",  # ← updated model
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
         }
         tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
@@ -303,7 +270,6 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
             raise Exception(f"TTS error status {tts_resp.status_code}")
     except Exception as e:
         print(f"[{datetime.utcnow()}] ElevenLabs TTS error: {e}")
-        # As a last resort, fall back to Twilio’s <Say>
         vr = VoiceResponse()
         gather = vr.gather(
             input="speech",
@@ -314,7 +280,6 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
         gather.say(text)
         return vr
 
-    # If TTS succeeded, return <Play> inside <Gather>
     vr = VoiceResponse()
     gather = vr.gather(
         input="speech",
@@ -325,43 +290,21 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
     gather.play(f"{BASE_URL}/static/{tts_filename}")
     return vr
 
-
 # ─── Incoming Call: Play Greeting inside <Gather> ───────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
-    """
-    When Twilio POSTs here on a new incoming call:
-      • Reset reprompt_count,
-      • Generate TTS greeting via ElevenLabs,
-      • Wrap that greeting inside a <Gather> so Twilio will listen during playback.
-    """
     form = await request.form()
     call_sid = form.get("CallSid")
     if not call_sid:
         return Response(status_code=400)
 
-    # Reset any previous reprompts
     reset_reprompt_count(call_sid)
-
     greeting_text = "Hello, thank you for calling the pharmacy. How can I help you today?"
     return generate_and_play_tts(greeting_text, call_sid, suffix="greeting")
-
 
 # ─── Process Recording: Main multi‐turn logic ────────────────────────────────────
 @app.post("/process-recording")
 async def process_recording(request: Request):
-    """
-    This endpoint is called by Twilio after each <Gather> (including silent timeouts).
-    Steps:
-      A) If no speech → reprompt (up to 3 times) → finally hang up.
-      B) If speech but low confidence (< 0.5) → single reprompt.
-      C) Otherwise, handle mid-call corrections if user said “actually…”.
-      D) Once we have a valid user_text (conf ≥ 0.5):
-         1) If we’re in a slot‐filling subflow (VACCINE, REFILL, NEAREST), continue those.
-         2) Else if new intent is VACCINE, REFILL, HOURS, or NEAREST, begin that flow.
-         3) Else FALLBACK to GPT (with few‐shot examples).
-      E) After generating assistant_reply, wrap it in TTS and <Gather> again.
-    """
     form = await request.form()
     call_sid       = form.get("CallSid")
     user_speech    = form.get("SpeechResult")
@@ -370,7 +313,6 @@ async def process_recording(request: Request):
     if not call_sid:
         return Response(status_code=400)
 
-    # Convert confidence to float (default 0.0)
     try:
         confidence = float(confidence_str) if confidence_str is not None else 0.0
     except ValueError:
@@ -379,7 +321,7 @@ async def process_recording(request: Request):
     history   = get_history(call_sid)
     reprompts = get_reprompt_count(call_sid)
 
-    # ─── A) SILENCE: reprompt ≤ 3 times, then final hangup ───────────────────────
+    # A) SILENCE
     if not user_speech or user_speech.strip() == "":
         if reprompts < 3:
             increment_reprompt_count(call_sid)
@@ -413,7 +355,7 @@ async def process_recording(request: Request):
             )
             return Response(content=str(vr), media_type="application/xml")
 
-    # ─── B) LOW CONFIDENCE: reprompt once (do not increment reprompt_count) ───────
+    # B) LOW CONFIDENCE
     if confidence < 0.5:
         text = "I’m sorry, I didn’t catch that clearly. Could you please repeat?"
         vr = VoiceResponse()
@@ -433,28 +375,21 @@ async def process_recording(request: Request):
         )
         return Response(content=str(vr), media_type="application/xml")
 
-    # ─── C) At this point: user_speech exists & confidence ≥ 0.5 ──────────────────
+    # C) VALID SPEECH
     user_text = user_speech.strip()
     reset_reprompt_count(call_sid)
     print(f"[{datetime.utcnow()}] CallSid={call_sid} • User said: {user_text!r} (conf={confidence})")
 
-    # Detect a “correction” phrase: begins with “actually”, “i mean”, “sorry”, “change”
+    # Corrections
     lower = user_text.lower()
     correction_keywords = ("actually", "i mean", "sorry", "change")
     if any(lower.startswith(k) for k in correction_keywords):
-        # User is correcting the last captured slot. We’ll:
-        #  1) Find the last system slot entry in history (vaccine_type/patient_name/nearest_postal)
-        #  2) Override that slot with the corrected text (stripping the keyword prefix).
-        #  3) Re-ask the same slot question instead of advancing the flow.
-
-        # Extract the “corrected portion” by removing leading keyword + punctuation
         corrected = user_text
         for k in correction_keywords:
             if lower.startswith(k):
                 corrected = user_text[len(k):].strip(" ,:")
                 break
 
-        # Find last slot in history: look for the most recent system‐role JSON message
         last_slot_idx = None
         last_slot_key = None
         for idx in reversed(range(len(history))):
@@ -462,7 +397,6 @@ async def process_recording(request: Request):
             if msg["role"] == "system":
                 try:
                     slot_obj = json.loads(msg["content"])
-                    # We expect slot_obj to be like {"vaccine_type":"…"} or {"patient_name":"…"} or {"nearest_postal":"…"}
                     if isinstance(slot_obj, dict) and len(slot_obj) == 1:
                         last_slot_idx = idx
                         last_slot_key = next(iter(slot_obj.keys()))
@@ -471,16 +405,13 @@ async def process_recording(request: Request):
                     continue
 
         if last_slot_idx is not None and last_slot_key:
-            # Override that slot
             history[last_slot_idx] = {"role": "system", "content": json.dumps({last_slot_key: corrected})}
 
-            # Determine which question to re-ask
             if last_slot_key == "vaccine_type":
                 assistant_reply = f"Sure—so you want the {corrected} vaccine. May I have your full name, please?"
             elif last_slot_key == "patient_name":
                 assistant_reply = f"Thank you. Noted your name as {corrected}. On which date would you like to book your appointment?"
             elif last_slot_key == "desired_date":
-                # Finalize booking with corrected date
                 slot_data = {}
                 for msg in history:
                     if msg["role"] == "system":
@@ -491,10 +422,7 @@ async def process_recording(request: Request):
                 vt = slot_data.get("vaccine_type", "your vaccine")
                 pn = slot_data.get("patient_name", "the patient")
                 dd = corrected
-
-                # Save booking to DB
                 save_booking(call_sid, vt, pn, dd)
-
                 assistant_reply = f"Thank you. Your {vt} appointment for {pn} on {dd} is booked. Goodbye."
                 log_call_turn(
                     call_sid=call_sid,
@@ -505,21 +433,17 @@ async def process_recording(request: Request):
                 )
                 history.append({"role": "assistant", "content": assistant_reply})
                 save_history(call_sid, history)
-
-                # Generate final TTS and hang up
                 vr = generate_and_play_tts(assistant_reply, call_sid, suffix="finalv")
                 vr.hangup()
                 return Response(content=str(vr), media_type="application/xml")
             elif last_slot_key == "nearest_postal":
                 assistant_reply = f"Got it—your postal code is {corrected}. Looking up nearest pharmacies..."
                 user_text = corrected
-                # Remove previous assistant prompt about postal code so we re-run NEAREST logic
             else:
                 assistant_reply = "I’m sorry, I’m not sure what you wish to correct. Could you please restate?"
         else:
             assistant_reply = "I’m sorry, I’m not sure what you wish to correct. Could you please restate?"
 
-        # Append assistant_reply to history & return
         history.append({"role": "assistant", "content": assistant_reply})
         save_history(call_sid, history)
         log_call_turn(
@@ -531,16 +455,14 @@ async def process_recording(request: Request):
         )
         return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="corr")), media_type="application/xml")
 
-    # ─── D) Check if we’re in the middle of “vaccine” subflow ──────────────────────
+    # D) Vaccine subflow
     last_assistant = history[-1]["content"] if history and history[-1]["role"] == "assistant" else ""
     if last_assistant.startswith("Which vaccine would you like"):
-        # 1st slot: vaccine_type
         vaccine_type = user_text
         history.append({"role": "system", "content": json.dumps({"vaccine_type": vaccine_type})})
         assistant_reply = "Got it. May I have your full name, please?"
         history.append({"role": "assistant", "content": assistant_reply})
         save_history(call_sid, history)
-
         log_call_turn(
             call_sid=call_sid,
             turn_number=(len(history)//2),
@@ -551,13 +473,11 @@ async def process_recording(request: Request):
         return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="ask_name")), media_type="application/xml")
 
     elif last_assistant.startswith("Got it. May I have your full name"):
-        # 2nd slot: patient_name
         patient_name = user_text
         history.append({"role": "system", "content": json.dumps({"patient_name": patient_name})})
         assistant_reply = "Thank you. On which date would you like to book your appointment? Please say the date."
         history.append({"role": "assistant", "content": assistant_reply})
         save_history(call_sid, history)
-
         log_call_turn(
             call_sid=call_sid,
             turn_number=(len(history)//2),
@@ -568,7 +488,6 @@ async def process_recording(request: Request):
         return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="ask_date")), media_type="application/xml")
 
     elif last_assistant.startswith("Thank you. On which date"):
-        # 3rd slot: desired_date → confirm booking
         desired_date = user_text
         slot_data = {}
         for msg in history:
@@ -580,14 +499,10 @@ async def process_recording(request: Request):
         vt = slot_data.get("vaccine_type", "your vaccine")
         pn = slot_data.get("patient_name", "the patient")
         dd = desired_date
-
-        # Save booking to DB
         save_booking(call_sid, vt, pn, dd)
-
         assistant_reply = f"Thank you. Your {vt} appointment for {pn} on {dd} is booked. Goodbye."
         history.append({"role": "assistant", "content": assistant_reply})
         save_history(call_sid, history)
-
         log_call_turn(
             call_sid=call_sid,
             turn_number=(len(history)//2),
@@ -595,20 +510,15 @@ async def process_recording(request: Request):
             assistant_reply=assistant_reply,
             error_message="VACCINE_BOOKED"
         )
-
-        # Generate final confirmation TTS then hang up
         vr = generate_and_play_tts(assistant_reply, call_sid, suffix="finalv")
         vr.hangup()
         return Response(content=str(vr), media_type="application/xml")
 
-    # ─── E) Check if we’re in the middle of “nearest pharmacy” subflow ────────────
+    # E) Nearest pharmacy subflow
     last_assistant = history[-1]["content"] if history and history[-1]["role"] == "assistant" else ""
     if last_assistant.startswith("Sure—what’s your postal code"):
-        # Treat user_text as postal code
         postal_code = user_text.replace(" ", "")
         history.append({"role": "system", "content": json.dumps({"nearest_postal": postal_code})})
-
-        # 1) Geocode postal code → lat/lng
         geo_url = (
             "https://maps.googleapis.com/maps/api/geocode/json"
             f"?address={postal_code},Canada&key={GOOGLE_MAPS_API_KEY}"
@@ -635,7 +545,6 @@ async def process_recording(request: Request):
             )
             return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="err_pc")), media_type="application/xml")
 
-        # 2) Nearby Search for pharmacies within 5 km
         places_url = (
             "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
             f"?location={lat},{lng}&radius=5000&type=pharmacy&key={GOOGLE_MAPS_API_KEY}"
@@ -671,7 +580,6 @@ async def process_recording(request: Request):
             )
             return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="err_pc2")), media_type="application/xml")
 
-        # 3) Valid nearest-list response
         history.append({"role": "assistant", "content": assistant_reply})
         save_history(call_sid, history)
         log_call_turn(
@@ -683,7 +591,7 @@ async def process_recording(request: Request):
         )
         return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="nearest")), media_type="application/xml")
 
-    # ─── F) Else: New intent detection based on user_text ─────────────────────────
+    # F) New intent detection
     intent = classify_intent(user_text)
 
     if intent == "VACCINE":
@@ -698,7 +606,6 @@ async def process_recording(request: Request):
     elif intent == "NEAREST":
         assistant_reply = "Sure—what’s your postal code (Canada)?"
     else:
-        # ── G) GENERAL fallback: GPT with few-shot examples ─────────────────────────
         few_shot = [
             {
                 "role": "system",
@@ -707,38 +614,14 @@ async def process_recording(request: Request):
                     "Keep replies under 300 characters."
                 )
             },
-            {
-                "role": "user",
-                "content": "I want to schedule a vaccine appointment."
-            },
-            {
-                "role": "assistant",
-                "content": "Which vaccine would you like? Please say the vaccine name."
-            },
-            {
-                "role": "user",
-                "content": "I need to refill my prescription."
-            },
-            {
-                "role": "assistant",
-                "content": "Of course. What is your prescription number?"
-            },
-            {
-                "role": "user",
-                "content": "What are your pharmacy hours on Saturday?"
-            },
-            {
-                "role": "assistant",
-                "content": "We’re open Monday–Friday 9 AM–6 PM, and Saturday 10 AM–4 PM. Anything else?"
-            },
-            {
-                "role": "user",
-                "content": "Do you have ibuprofen 200 mg in stock?"
-            },
-            {
-                "role": "assistant",
-                "content": "Let me check… Yes, we have ibuprofen 200 mg in stock. Would you like me to hold some for you?"
-            },
+            {"role": "user", "content": "I want to schedule a vaccine appointment."},
+            {"role": "assistant", "content": "Which vaccine would you like? Please say the vaccine name."},
+            {"role": "user", "content": "I need to refill my prescription."},
+            {"role": "assistant", "content": "Of course. What is your prescription number?"},
+            {"role": "user", "content": "What are your pharmacy hours on Saturday?"},
+            {"role": "assistant", "content": "We’re open Monday–Friday 9 AM–6 PM, and Saturday 10 AM–4 PM. Anything else?"},
+            {"role": "user", "content": "Do you have ibuprofen 200 mg in stock?"},
+            {"role": "assistant", "content": "Let me check… Yes, we have ibuprofen 200 mg in stock. Would you like me to hold some for you?"},
         ]
         prompt_with_instructions = few_shot + history
         try:
@@ -762,7 +645,7 @@ async def process_recording(request: Request):
                 error_message=error_msg
             )
 
-    # ─── H) Append assistant_reply to history & log turn ─────────────────────────
+    # H) Append assistant_reply & log
     if assistant_reply is None:
         assistant_reply = "I’m sorry, I’m not sure how to help with that. Goodbye."
 
@@ -776,7 +659,7 @@ async def process_recording(request: Request):
         error_message=None
     )
 
-    # ─── I) Generate TTS for assistant_reply and wrap in <Gather> ───────────────
+    # I) Generate TTS + <Gather>
     vr = generate_and_play_tts(assistant_reply, call_sid, suffix=str(int(time.time())))
     return Response(content=str(vr), media_type="application/xml")
 
