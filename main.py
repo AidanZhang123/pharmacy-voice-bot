@@ -26,7 +26,7 @@ app.add_middleware(
 
 # ─── Load API keys & config from .env ───────────────────────────────────────────
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
-ELEVEN_API_KEY       = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_API_KEY   = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID             = os.getenv("ELEVENLABS_VOICE_ID")
 BASE_URL             = os.getenv("BASE_URL")            # e.g. "https://abcd1234.ngrok-free.app"
 GOOGLE_MAPS_API_KEY  = os.getenv("GOOGLE_MAPS_API_KEY") # for geocoding & Places lookups
@@ -65,9 +65,20 @@ def init_db():
                 timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # 3) bookings table: store completed vaccine bookings
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bookings (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid        TEXT,
+                vaccine_type    TEXT,
+                patient_name    TEXT,
+                desired_date    TEXT,
+                booked_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         conn.commit()
 
-        # 3) If reprompt_count is missing (old schema), add it
+        # 4) If reprompt_count is missing (old schema), add it
         c.execute("PRAGMA table_info(conversations);")
         cols = [row[1] for row in c.fetchall()]
         if "reprompt_count" not in cols:
@@ -214,6 +225,24 @@ def log_call_turn(call_sid: str, turn_number: int,
             print(f"[{datetime.utcnow()}] log_call_turn error for {call_sid}, turn {turn_number}: {e}")
     retry_sqlite(_log)
 
+def save_booking(call_sid: str, vaccine_type: str, patient_name: str, desired_date: str):
+    """
+    Insert a completed vaccine booking into the bookings table.
+    """
+    def _insert():
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO bookings (call_sid, vaccine_type, patient_name, desired_date)
+                VALUES (?, ?, ?, ?);
+            """, (call_sid, vaccine_type, patient_name, desired_date))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[{datetime.utcnow()}] save_booking error for {call_sid}: {e}")
+    retry_sqlite(_insert)
+
 init_db()
 
 # ─── Utility: Classify intents (VACCINE, REFILL, HOURS, NEAREST, GENERAL) ─────
@@ -233,15 +262,72 @@ def classify_intent(text: str) -> str:
         return "NEAREST"
     return "GENERAL"
 
+# ─── Helper: Generate ElevenLabs TTS MP3 and return a <Play> TwiML response ────
+def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> VoiceResponse:
+    """
+    Use ElevenLabs to generate an MP3 for `text`, save to static/,
+    then return a VoiceResponse that <Play>s that file inside a <Gather>.
+    """
+    tts_filename = f"tts_{call_sid}_{suffix}_{int(time.time())}.mp3"
+    tts_filepath = os.path.join("static", tts_filename)
+
+    # Debug: verify environment variables
+    print(
+        "ELEVENLABS_API_KEY set?", ELEVENLABS_API_KEY is not None,
+        "VOICE_ID:", VOICE_ID
+    )
+
+    # Call ElevenLabs TTS
+    try:
+        tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
+        }
+        tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
+        if tts_resp.status_code == 200 and tts_resp.content:
+            with open(tts_filepath, "wb") as f:
+                f.write(tts_resp.content)
+        else:
+            raise Exception(f"TTS error status {tts_resp.status_code}")
+    except Exception as e:
+        print(f"[{datetime.utcnow()}] ElevenLabs TTS error: {e}")
+        # As a last resort, fall back to Twilio’s <Say>
+        vr = VoiceResponse()
+        gather = vr.gather(
+            input="speech",
+            action=f"{BASE_URL}/process-recording",
+            method="POST",
+            speechTimeout="auto"
+        )
+        gather.say(text)
+        return vr
+
+    # If TTS succeeded, return <Play> inside <Gather>
+    vr = VoiceResponse()
+    gather = vr.gather(
+        input="speech",
+        action=f"{BASE_URL}/process-recording",
+        method="POST",
+        speechTimeout="auto"
+    )
+    gather.play(f"{BASE_URL}/static/{tts_filename}")
+    return vr
+
+
 # ─── Incoming Call: Play Greeting inside <Gather> ───────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
     """
     When Twilio POSTs here on a new incoming call:
       • Reset reprompt_count,
-      • Generate TTS greeting via ElevenLabs (fallback to <Say> if TTS fails),
+      • Generate TTS greeting via ElevenLabs,
       • Wrap that greeting inside a <Gather> so Twilio will listen during playback.
-    After playback, Twilio POSTs to /process-recording whether or not the caller spoke.
     """
     form = await request.form()
     call_sid = form.get("CallSid")
@@ -252,55 +338,7 @@ async def incoming_call(request: Request):
     reset_reprompt_count(call_sid)
 
     greeting_text = "Hello, thank you for calling the pharmacy. How can I help you today?"
-    tts_filename = f"greeting_{call_sid}.mp3"
-    tts_filepath = os.path.join("static", tts_filename)
-
-    # 1) Try ElevenLabs TTS (with up to 3 retries)
-    try:
-        attempts = 0
-        while attempts < 3:
-            tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-            headers = {
-                "xi-api-key": ELEVEN_API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "text": greeting_text,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-            }
-            tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-            if tts_resp.status_code == 200 and tts_resp.content:
-                with open(tts_filepath, "wb") as f:
-                    f.write(tts_resp.content)
-                break
-            attempts += 1
-            time.sleep(0.5)
-        else:
-            raise Exception(f"TTS failed (status {tts_resp.status_code})")
-    except Exception as e:
-        print(f"[{datetime.utcnow()}] Greeting TTS error: {e}")
-        # Fallback: simple <Say> inside <Gather>
-        twiml = VoiceResponse()
-        gather = twiml.gather(
-            input="speech",
-            action=f"{BASE_URL}/process-recording",
-            method="POST",
-            speechTimeout="auto"
-        )
-        gather.say("Hello, thank you for calling the pharmacy. How can I help you today?", voice="alice")
-        return Response(content=str(twiml), media_type="application/xml")
-
-    # 2) If TTS succeeded, play the MP3 inside <Gather>
-    twiml = VoiceResponse()
-    gather = twiml.gather(
-        input="speech",
-        action=f"{BASE_URL}/process-recording",
-        method="POST",
-        speechTimeout="auto"
-    )
-    gather.play(f"{BASE_URL}/static/{tts_filename}")
-    return Response(content=str(twiml), media_type="application/xml")
+    return generate_and_play_tts(greeting_text, call_sid, suffix="greeting")
 
 
 # ─── Process Recording: Main multi‐turn logic ────────────────────────────────────
@@ -339,14 +377,15 @@ async def process_recording(request: Request):
     if not user_speech or user_speech.strip() == "":
         if reprompts < 3:
             increment_reprompt_count(call_sid)
-            twiml = VoiceResponse()
-            gather = twiml.gather(
+            text = "I’m sorry, I didn’t hear anything. Could you please repeat?"
+            vr = VoiceResponse()
+            gather = vr.gather(
                 input="speech",
                 action=f"{BASE_URL}/process-recording",
                 method="POST",
                 speechTimeout="auto"
             )
-            gather.say("I’m sorry, I didn’t hear anything. Could you please repeat?", voice="alice")
+            gather.say(text)
             log_call_turn(
                 call_sid=call_sid,
                 turn_number=0,
@@ -354,11 +393,11 @@ async def process_recording(request: Request):
                 assistant_reply=None,
                 error_message="Silence reprompt"
             )
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(content=str(vr), media_type="application/xml")
         else:
-            twiml = VoiceResponse()
-            twiml.say("We did not receive any input. Goodbye.", voice="alice")
-            twiml.hangup()
+            vr = VoiceResponse()
+            vr.say("We did not receive any input. Goodbye.")
+            vr.hangup()
             log_call_turn(
                 call_sid=call_sid,
                 turn_number=0,
@@ -366,18 +405,19 @@ async def process_recording(request: Request):
                 assistant_reply=None,
                 error_message="Silence hangup after 3 reprompts"
             )
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(content=str(vr), media_type="application/xml")
 
     # ─── B) LOW CONFIDENCE: reprompt once (do not increment reprompt_count) ───────
     if confidence < 0.5:
-        twiml = VoiceResponse()
-        gather = twiml.gather(
+        text = "I’m sorry, I didn’t catch that clearly. Could you please repeat?"
+        vr = VoiceResponse()
+        gather = vr.gather(
             input="speech",
             action=f"{BASE_URL}/process-recording",
             method="POST",
             speechTimeout="auto"
         )
-        gather.say("I’m sorry, I didn’t catch that clearly. Could you please repeat?", voice="alice")
+        gather.say(text)
         log_call_turn(
             call_sid=call_sid,
             turn_number=0,
@@ -385,7 +425,7 @@ async def process_recording(request: Request):
             assistant_reply=None,
             error_message=f"Low confidence ({confidence})"
         )
-        return Response(content=str(twiml), media_type="application/xml")
+        return Response(content=str(vr), media_type="application/xml")
 
     # ─── C) At this point: user_speech exists & confidence ≥ 0.5 ──────────────────
     user_text = user_speech.strip()
@@ -434,11 +474,7 @@ async def process_recording(request: Request):
             elif last_slot_key == "patient_name":
                 assistant_reply = f"Thank you. Noted your name as {corrected}. On which date would you like to book your appointment?"
             elif last_slot_key == "desired_date":
-                assistant_reply = (
-                    f"Alright, setting your appointment date to {corrected}. "
-                    "Your booking is confirmed—thank you. Goodbye."
-                )
-                # LOG and confirm booking
+                # Finalize booking with corrected date
                 slot_data = {}
                 for msg in history:
                     if msg["role"] == "system":
@@ -448,6 +484,12 @@ async def process_recording(request: Request):
                             pass
                 vt = slot_data.get("vaccine_type", "your vaccine")
                 pn = slot_data.get("patient_name", "the patient")
+                dd = corrected
+
+                # Save booking to DB
+                save_booking(call_sid, vt, pn, dd)
+
+                assistant_reply = f"Thank you. Your {vt} appointment for {pn} on {dd} is booked. Goodbye."
                 log_call_turn(
                     call_sid=call_sid,
                     turn_number=(len(history)//2 + 1),
@@ -457,37 +499,11 @@ async def process_recording(request: Request):
                 )
                 history.append({"role": "assistant", "content": assistant_reply})
                 save_history(call_sid, history)
-                # Generate TTS + hang up
-                tts_filename = f"tts_{call_sid}_final.mp3"
-                tts_filepath = os.path.join("static", tts_filename)
-                try:
-                    tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-                    headers = {
-                        "xi-api-key": ELEVEN_API_KEY,
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "text": assistant_reply,
-                        "model_id": "eleven_monolingual_v1",
-                        "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-                    }
-                    tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-                    if tts_resp.status_code == 200 and tts_resp.content:
-                        with open(tts_filepath, "wb") as f:
-                            f.write(tts_resp.content)
-                    else:
-                        raise Exception(f"TTS error status {tts_resp.status_code}")
-                except Exception as e:
-                    print(f"[{datetime.utcnow()}] Final TTS error after correction: {e}")
-                    twiml = VoiceResponse()
-                    twiml.say(assistant_reply, voice="alice")
-                    twiml.hangup()
-                    return Response(content=str(twiml), media_type="application/xml")
 
-                twiml = VoiceResponse()
-                twiml.play(f"{BASE_URL}/static/{tts_filename}")
-                twiml.hangup()
-                return Response(content=str(twiml), media_type="application/xml")
+                # Generate final TTS and hang up
+                vr = generate_and_play_tts(assistant_reply, call_sid, suffix="finalv")
+                vr.hangup()
+                return Response(content=str(vr), media_type="application/xml")
             elif last_slot_key == "nearest_postal":
                 assistant_reply = f"Got it—your postal code is {corrected}. Looking up nearest pharmacies..."
                 user_text = corrected
@@ -507,51 +523,80 @@ async def process_recording(request: Request):
             assistant_reply=assistant_reply,
             error_message="Slot correction"
         )
+        return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="corr")), media_type="application/xml")
 
-        # Wrap reply in TTS + <Gather>
-        tts_filename = f"tts_{call_sid}_corr_{int(time.time())}.mp3"
-        tts_filepath = os.path.join("static", tts_filename)
-        try:
-            tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-            headers = {
-                "xi-api-key": ELEVEN_API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "text": assistant_reply,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-            }
-            tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-            if tts_resp.status_code == 200 and tts_resp.content:
-                with open(tts_filepath, "wb") as f:
-                    f.write(tts_resp.content)
-            else:
-                raise Exception(f"TTS error status {tts_resp.status_code}")
-        except Exception as e:
-            print(f"[{datetime.utcnow()}] TTS error after correction: {e}")
-            twiml = VoiceResponse()
-            gather = twiml.gather(
-                input="speech",
-                action=f"{BASE_URL}/process-recording",
-                method="POST",
-                speechTimeout="auto"
-            )
-            gather.say(assistant_reply, voice="alice")
-            return Response(content=str(twiml), media_type="application/xml")
+    # ─── D) Check if we’re in the middle of “vaccine” subflow ──────────────────────
+    last_assistant = history[-1]["content"] if history and history[-1]["role"] == "assistant" else ""
+    if last_assistant.startswith("Which vaccine would you like"):
+        # 1st slot: vaccine_type
+        vaccine_type = user_text
+        history.append({"role": "system", "content": json.dumps({"vaccine_type": vaccine_type})})
+        assistant_reply = "Got it. May I have your full name, please?"
+        history.append({"role": "assistant", "content": assistant_reply})
+        save_history(call_sid, history)
 
-        twiml = VoiceResponse()
-        gather = twiml.gather(
-            input="speech",
-            action=f"{BASE_URL}/process-recording",
-            method="POST",
-            speechTimeout="auto"
+        log_call_turn(
+            call_sid=call_sid,
+            turn_number=(len(history)//2),
+            user_text=vaccine_type,
+            assistant_reply=assistant_reply,
+            error_message=None
         )
-        gather.play(f"{BASE_URL}/static/{tts_filename}")
-        return Response(content=str(twiml), media_type="application/xml")
+        return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="ask_name")), media_type="application/xml")
 
-    # ─── D) Check if we’re in the middle of “nearest pharmacy” subflow ────────────
-    last_assistant = history[-2]["content"] if len(history) >= 2 and history[-2]["role"] == "assistant" else ""
+    elif last_assistant.startswith("Got it. May I have your full name"):
+        # 2nd slot: patient_name
+        patient_name = user_text
+        history.append({"role": "system", "content": json.dumps({"patient_name": patient_name})})
+        assistant_reply = "Thank you. On which date would you like to book your appointment? Please say the date."
+        history.append({"role": "assistant", "content": assistant_reply})
+        save_history(call_sid, history)
+
+        log_call_turn(
+            call_sid=call_sid,
+            turn_number=(len(history)//2),
+            user_text=patient_name,
+            assistant_reply=assistant_reply,
+            error_message=None
+        )
+        return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="ask_date")), media_type="application/xml")
+
+    elif last_assistant.startswith("Thank you. On which date"):
+        # 3rd slot: desired_date → confirm booking
+        desired_date = user_text
+        slot_data = {}
+        for msg in history:
+            if msg["role"] == "system":
+                try:
+                    slot_data.update(json.loads(msg["content"]))
+                except:
+                    pass
+        vt = slot_data.get("vaccine_type", "your vaccine")
+        pn = slot_data.get("patient_name", "the patient")
+        dd = desired_date
+
+        # Save booking to DB
+        save_booking(call_sid, vt, pn, dd)
+
+        assistant_reply = f"Thank you. Your {vt} appointment for {pn} on {dd} is booked. Goodbye."
+        history.append({"role": "assistant", "content": assistant_reply})
+        save_history(call_sid, history)
+
+        log_call_turn(
+            call_sid=call_sid,
+            turn_number=(len(history)//2),
+            user_text=desired_date,
+            assistant_reply=assistant_reply,
+            error_message="VACCINE_BOOKED"
+        )
+
+        # Generate final confirmation TTS then hang up
+        vr = generate_and_play_tts(assistant_reply, call_sid, suffix="finalv")
+        vr.hangup()
+        return Response(content=str(vr), media_type="application/xml")
+
+    # ─── E) Check if we’re in the middle of “nearest pharmacy” subflow ────────────
+    last_assistant = history[-1]["content"] if history and history[-1]["role"] == "assistant" else ""
     if last_assistant.startswith("Sure—what’s your postal code"):
         # Treat user_text as postal code
         postal_code = user_text.replace(" ", "")
@@ -577,52 +622,12 @@ async def process_recording(request: Request):
             save_history(call_sid, history)
             log_call_turn(
                 call_sid=call_sid,
-                turn_number=(len(history)//2 + 1),
+                turn_number=(len(history)//2),
                 user_text=postal_code,
                 assistant_reply=assistant_reply,
                 error_message="Geocode failed"
             )
-            # Reprompt for postal code
-            tts_filename = f"tts_{call_sid}_err_pc_{int(time.time())}.mp3"
-            tts_filepath = os.path.join("static", tts_filename)
-            try:
-                tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-                headers = {
-                    "xi-api-key": ELEVEN_API_KEY,
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "text": assistant_reply,
-                    "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-                }
-                tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-                if tts_resp.status_code == 200 and tts_resp.content:
-                    with open(tts_filepath, "wb") as f:
-                        f.write(tts_resp.content)
-                else:
-                    raise Exception(f"TTS status {tts_resp.status_code}")
-            except Exception as e2:
-                print(f"[{datetime.utcnow()}] TTS error (postal code retry): {e2}")
-                twiml = VoiceResponse()
-                gather = twiml.gather(
-                    input="speech",
-                    action=f"{BASE_URL}/process-recording",
-                    method="POST",
-                    speechTimeout="auto"
-                )
-                gather.say(assistant_reply, voice="alice")
-                return Response(content=str(twiml), media_type="application/xml")
-
-            twiml = VoiceResponse()
-            gather = twiml.gather(
-                input="speech",
-                action=f"{BASE_URL}/process-recording",
-                method="POST",
-                speechTimeout="auto"
-            )
-            gather.play(f"{BASE_URL}/static/{tts_filename}")
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="err_pc")), media_type="application/xml")
 
         # 2) Nearby Search for pharmacies within 5 km
         places_url = (
@@ -653,180 +658,24 @@ async def process_recording(request: Request):
             save_history(call_sid, history)
             log_call_turn(
                 call_sid=call_sid,
-                turn_number=(len(history)//2 + 1),
+                turn_number=(len(history)//2),
                 user_text=postal_code,
                 assistant_reply=assistant_reply,
                 error_message="Places API failed"
             )
-            # Reprompt for postal code
-            tts_filename = f"tts_{call_sid}_err_pc2_{int(time.time())}.mp3"
-            tts_filepath = os.path.join("static", tts_filename)
-            try:
-                tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-                headers = {
-                    "xi-api-key": ELEVEN_API_KEY,
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "text": assistant_reply,
-                    "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-                }
-                tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-                if tts_resp.status_code == 200 and tts_resp.content:
-                    with open(tts_filepath, "wb") as f:
-                        f.write(tts_resp.content)
-                else:
-                    raise Exception(f"TTS status {tts_resp.status_code}")
-            except Exception as e2:
-                print(f"[{datetime.utcnow()}] TTS error (Places retry): {e2}")
-                twiml = VoiceResponse()
-                gather = twiml.gather(
-                    input="speech",
-                    action=f"{BASE_URL}/process-recording",
-                    method="POST",
-                    speechTimeout="auto"
-                )
-                gather.say(assistant_reply, voice="alice")
-                return Response(content=str(twiml), media_type="application/xml")
-
-            twiml = VoiceResponse()
-            gather = twiml.gather(
-                input="speech",
-                action=f"{BASE_URL}/process-recording",
-                method="POST",
-                speechTimeout="auto"
-            )
-            gather.play(f"{BASE_URL}/static/{tts_filename}")
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="err_pc2")), media_type="application/xml")
 
         # 3) Valid nearest-list response
         history.append({"role": "assistant", "content": assistant_reply})
         save_history(call_sid, history)
         log_call_turn(
             call_sid=call_sid,
-            turn_number=(len(history)//2 + 1),
+            turn_number=(len(history)//2),
             user_text=postal_code,
             assistant_reply=assistant_reply,
             error_message=None
         )
-
-        # Generate TTS + <Gather> again
-        tts_filename = f"tts_{call_sid}_nearest_{int(time.time())}.mp3"
-        tts_filepath = os.path.join("static", tts_filename)
-        try:
-            tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-            headers = {
-                "xi-api-key": ELEVEN_API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "text": assistant_reply,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-            }
-            tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-            if tts_resp.status_code == 200 and tts_resp.content:
-                with open(tts_filepath, "wb") as f:
-                    f.write(tts_resp.content)
-            else:
-                raise Exception(f"TTS error status {tts_resp.status_code}")
-        except Exception as e:
-            print(f"[{datetime.utcnow()}] TTS error (nearest): {e}")
-            twiml = VoiceResponse()
-            gather = twiml.gather(
-                input="speech",
-                action=f"{BASE_URL}/process-recording",
-                method="POST",
-                speechTimeout="auto"
-            )
-            gather.say(assistant_reply, voice="alice")
-            return Response(content=str(twiml), media_type="application/xml")
-
-        twiml = VoiceResponse()
-        gather = twiml.gather(
-            input="speech",
-            action=f"{BASE_URL}/process-recording",
-            method="POST",
-            speechTimeout="auto"
-        )
-        gather.play(f"{BASE_URL}/static/{tts_filename}")
-        return Response(content=str(twiml), media_type="application/xml")
-
-    # ─── E) Check if we’re in the middle of “vaccine” subflow ──────────────────────
-    last_assistant = history[-2]["content"] if len(history) >= 2 and history[-2]["role"] == "assistant" else ""
-
-    if last_assistant.startswith("Which vaccine would you like"):
-        # 1st slot: vaccine_type
-        vaccine_type = user_text
-        history.append({"role": "system", "content": json.dumps({"vaccine_type": vaccine_type})})
-        assistant_reply = "Got it. And can I have your full name, please?"
-
-    elif last_assistant.startswith("Got it. And can I have your full name"):
-        # 2nd slot: patient_name
-        patient_name = user_text
-        history.append({"role": "system", "content": json.dumps({"patient_name": patient_name})})
-        assistant_reply = (
-            "Thank you. Finally, on which date would you like to book your appointment? Please say the date."
-        )
-
-    elif last_assistant.startswith("Thank you. Finally, on which date"):
-        # 3rd slot: desired_date → confirm booking
-        desired_date = user_text
-        slot_data = {}
-        for msg in history:
-            if msg["role"] == "system":
-                try:
-                    slot_data.update(json.loads(msg["content"]))
-                except:
-                    pass
-        vt = slot_data.get("vaccine_type", "your vaccine")
-        pn = slot_data.get("patient_name", "the patient")
-
-        assistant_reply = (
-            f"Thank you. Your {vt} appointment for {pn} on {desired_date} is booked. Goodbye."
-        )
-        log_call_turn(
-            call_sid=call_sid,
-            turn_number=(len(history)//2 + 1),
-            user_text=desired_date,
-            assistant_reply=assistant_reply,
-            error_message="VACCINE_BOOKED"
-        )
-        history.append({"role": "assistant", "content": assistant_reply})
-        save_history(call_sid, history)
-
-        # Generate final confirmation TTS then hang up
-        tts_filename = f"tts_{call_sid}_finalv_{int(time.time())}.mp3"
-        tts_filepath = os.path.join("static", tts_filename)
-        try:
-            tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-            headers = {
-                "xi-api-key": ELEVEN_API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "text": assistant_reply,
-                "model_id": "eleven_monolingual_v1",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-            }
-            tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-            if tts_resp.status_code == 200 and tts_resp.content:
-                with open(tts_filepath, "wb") as f:
-                    f.write(tts_resp.content)
-            else:
-                raise Exception(f"TTS status {tts_resp.status_code}")
-        except Exception as e:
-            print(f"[{datetime.utcnow()}] Final TTS error (vaccine): {e}")
-            twiml = VoiceResponse()
-            twiml.say(assistant_reply, voice="alice")
-            twiml.hangup()
-            return Response(content=str(twiml), media_type="application/xml")
-
-        twiml = VoiceResponse()
-        twiml.play(f"{BASE_URL}/static/{tts_filename}")
-        twiml.hangup()
-        return Response(content=str(twiml), media_type="application/xml")
+        return Response(content=str(generate_and_play_tts(assistant_reply, call_sid, suffix="nearest")), media_type="application/xml")
 
     # ─── F) Else: New intent detection based on user_text ─────────────────────────
     intent = classify_intent(user_text)
@@ -852,7 +701,6 @@ async def process_recording(request: Request):
                     "Keep replies under 300 characters."
                 )
             },
-            # Example 1: vaccine booking
             {
                 "role": "user",
                 "content": "I want to schedule a vaccine appointment."
@@ -861,7 +709,6 @@ async def process_recording(request: Request):
                 "role": "assistant",
                 "content": "Which vaccine would you like? Please say the vaccine name."
             },
-            # Example 2: prescription refill
             {
                 "role": "user",
                 "content": "I need to refill my prescription."
@@ -870,7 +717,6 @@ async def process_recording(request: Request):
                 "role": "assistant",
                 "content": "Of course. What is your prescription number?"
             },
-            # Example 3: store hours
             {
                 "role": "user",
                 "content": "What are your pharmacy hours on Saturday?"
@@ -879,7 +725,6 @@ async def process_recording(request: Request):
                 "role": "assistant",
                 "content": "We’re open Monday–Friday 9 AM–6 PM, and Saturday 10 AM–4 PM. Anything else?"
             },
-            # Example 4: checking stock
             {
                 "role": "user",
                 "content": "Do you have ibuprofen 200 mg in stock?"
@@ -926,48 +771,8 @@ async def process_recording(request: Request):
     )
 
     # ─── I) Generate TTS for assistant_reply and wrap in <Gather> ───────────────
-    tts_filename = f"tts_{call_sid}_{int(time.time())}.mp3"
-    tts_filepath = os.path.join("static", tts_filename)
-    try:
-        tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-        headers = {
-            "xi-api-key": ELEVEN_API_KEY,
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "text": assistant_reply,
-            "model_id": "eleven_monolingual_v1",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
-        }
-        tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-        if tts_resp.status_code == 200 and tts_resp.content:
-            with open(tts_filepath, "wb") as f:
-                f.write(tts_resp.content)
-        else:
-            raise Exception(f"TTS error status {tts_resp.status_code}")
-    except Exception as e:
-        print(f"[{datetime.utcnow()}] TTS error: {e}")
-        # Fallback: simply <Say> the assistant_reply and gather again
-        twiml = VoiceResponse()
-        gather = twiml.gather(
-            input="speech",
-            action=f"{BASE_URL}/process-recording",
-            method="POST",
-            speechTimeout="auto"
-        )
-        gather.say(assistant_reply, voice="alice")
-        return Response(content=str(twiml), media_type="application/xml")
-
-    # Play the TTS MP3 inside a new <Gather> (so Twilio listens during playback).
-    twiml = VoiceResponse()
-    gather = twiml.gather(
-        input="speech",
-        action=f"{BASE_URL}/process-recording",
-        method="POST",
-        speechTimeout="auto"
-    )
-    gather.play(f"{BASE_URL}/static/{tts_filename}")
-    return Response(content=str(twiml), media_type="application/xml")
+    vr = generate_and_play_tts(assistant_reply, call_sid, suffix=str(int(time.time())))
+    return Response(content=str(vr), media_type="application/xml")
 
 
 # ─── API endpoints for React dashboard (unchanged) ──────────────────────────────
