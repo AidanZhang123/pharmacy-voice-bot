@@ -216,6 +216,10 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
     tts_filename = f"tts_{call_sid}_{suffix}_{int(time.time())}.mp3"
     tts_filepath = os.path.join("static", tts_filename)
 
+    # Debug env
+    print("🔑 ELEVENLABS_API_KEY set?", ELEVENLABS_API_KEY is not None,
+          "VOICE_ID:", VOICE_ID)
+
     try:
         tts_endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
         headers = {
@@ -224,29 +228,40 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
         }
         payload = {
             "text": text,
-            "model_id": "eleven_english_v1",
+            "model_id": "eleven_monolingual_v1",   # try changing this if you still get 400
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
         }
-        tts_resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
-        if tts_resp.status_code != 200 or not tts_resp.content:
-            raise Exception(f"TTS error status {tts_resp.status_code}")
+        resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
+        if resp.status_code != 200 or not resp.content:
+            # log full error for diagnosis
+            print(f"[{datetime.utcnow()}] ElevenLabs TTS error status {resp.status_code}, body: {resp.text}")
+            raise Exception(f"TTS bad status {resp.status_code}")
         with open(tts_filepath, "wb") as f:
-            f.write(tts_resp.content)
-    except Exception as e:
-        print(f"[{datetime.utcnow()}] ElevenLabs TTS error: {e}")
+            f.write(resp.content)
+
+        # success → play the MP3
         vr = VoiceResponse()
-        vr.say(text)  # fallback to Twilio
+        gather = vr.gather(
+            input="speech",
+            action=f"{BASE_URL}/process-recording",
+            method="POST",
+            speechTimeout="auto"
+        )
+        gather.play(f"{BASE_URL}/static/{tts_filename}")
         return vr
 
-    vr = VoiceResponse()
-    gather = vr.gather(
-        input="speech",
-        action=f"{BASE_URL}/process-recording",
-        method="POST",
-        speechTimeout="auto"
-    )
-    gather.play(f"{BASE_URL}/static/{tts_filename}")
-    return vr
+    except Exception as e:
+        # fallback: still wrap in a Gather so the call doesn't just drop
+        print(f"[{datetime.utcnow()}] ElevenLabs TTS error: {e}")
+        vr = VoiceResponse()
+        gather = vr.gather(
+            input="speech",
+            action=f"{BASE_URL}/process-recording",
+            method="POST",
+            speechTimeout="auto"
+        )
+        gather.say(text)  
+        return vr
 
 # ─── Incoming Call ──────────────────────────────────────────────────────────────
 @app.post("/incoming-call")
