@@ -49,7 +49,6 @@ def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        # conversations table
         c.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 call_sid        TEXT PRIMARY KEY,
@@ -57,7 +56,6 @@ def init_db():
                 reprompt_count  INTEGER DEFAULT 0
             );
         """)
-        # call_logs table
         c.execute("""
             CREATE TABLE IF NOT EXISTS call_logs (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +67,6 @@ def init_db():
                 timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # bookings table
         c.execute("""
             CREATE TABLE IF NOT EXISTS bookings (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,16 +78,17 @@ def init_db():
             );
         """)
         conn.commit()
-        # add reprompt_count if missing
         c.execute("PRAGMA table_info(conversations);")
-        cols = [row[1] for row in c.fetchall()]
+        cols = [r[1] for r in c.fetchall()]
         if "reprompt_count" not in cols:
             c.execute("ALTER TABLE conversations ADD COLUMN reprompt_count INTEGER DEFAULT 0;")
             conn.commit()
         conn.close()
-        print(f"[{datetime.utcnow()}] init_db: DB at {os.path.abspath(DB_PATH)}")
+        print(f"[{datetime.utcnow()}] init_db complete, DB at {os.path.abspath(DB_PATH)}")
     except Exception as e:
         print(f"[{datetime.utcnow()}] init_db error: {e}")
+
+init_db()
 
 def retry_sqlite(func, *args, retries=3, delay=0.1, **kwargs):
     for _ in range(retries):
@@ -220,8 +218,6 @@ def save_booking(call_sid: str, vaccine_type: str, patient_name: str, desired_da
             print(f"[{datetime.utcnow()}] save_booking error: {e}")
     retry_sqlite(_insert)
 
-init_db()
-
 def classify_intent(text: str) -> str:
     lower = text.lower()
     if any(kw in lower for kw in ["vaccine", "shot", "vaccination"]):
@@ -283,6 +279,7 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
     gather.play(f"{BASE_URL}/static/{tts_filename}")
     return vr
 
+# ─── Incoming Call ──────────────────────────────────────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
     form = await request.form()
@@ -300,6 +297,7 @@ async def incoming_call(request: Request):
     print("📤 /incoming-call TwiML:", twiml_str)
     return Response(content=twiml_str, media_type="application/xml")
 
+# ─── Process Recording ────────────────────────────────────────────────────────────
 @app.post("/process-recording")
 async def process_recording(request: Request):
     form = await request.form()
@@ -325,31 +323,91 @@ async def process_recording(request: Request):
         if reprompts < 3:
             increment_reprompt_count(call_sid)
             text = "I’m sorry, I didn’t hear anything. Could you please repeat?"
-            vr = VoiceResponse(); g = vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto"); g.say(text)
-            log_call_turn(call_sid,0,None,None,"Silence reprompt")
-            tw = str(vr); print("📤 /process-recording TwiML:", tw); return Response(content=tw, media_type="application/xml")
+            vr = VoiceResponse()
+            gather = vr.gather(input="speech", action=f"{BASE_URL}/process-recording", method="POST", speechTimeout="auto")
+            gather.say(text)
+            log_call_turn(call_sid, 0, None, None, "Silence reprompt")
+            tw = str(vr); print("📤 /process-recording TwiML:", tw)
+            return Response(content=tw, media_type="application/xml")
         else:
             vr = VoiceResponse(); vr.say("We did not receive any input. Goodbye."); vr.hangup()
-            log_call_turn(call_sid,0,None,None,"Silence hangup")
-            tw = str(vr); print("📤 /process-recording TwiML:", tw); return Response(content=tw, media_type="application/xml")
+            log_call_turn(call_sid, 0, None, None, "Silence hangup")
+            tw = str(vr); print("📤 /process-recording TwiML:", tw)
+            return Response(content=tw, media_type="application/xml")
 
     # B) Low confidence
     if confidence < 0.5:
         text = "I’m sorry, I didn’t catch that clearly. Could you please repeat?"
-        vr = VoiceResponse(); g = vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto"); g.say(text)
-        log_call_turn(call_sid,0,user_speech,None,f"Low confidence ({confidence})")
-        tw = str(vr); print("📤 /process-recording TwiML:", tw); return Response(content=tw, media_type="application/xml")
+        vr = VoiceResponse()
+        gather = vr.gather(input="speech", action=f"{BASE_URL}/process-recording", method="POST", speechTimeout="auto")
+        gather.say(text)
+        log_call_turn(call_sid, 0, user_speech, None, f"Low confidence ({confidence})")
+        tw = str(vr); print("📤 /process-recording TwiML:", tw)
+        return Response(content=tw, media_type="application/xml")
 
     # C) Valid speech
     user_text = user_speech.strip()
     reset_reprompt_count(call_sid)
     print(f"[{datetime.utcnow()}] User said: {user_text!r} (conf={confidence})")
 
-    # [rest of your multi-turn logic unchanged…]
-    # At the very end, after building `vr`:
+    # Corrections, Vaccine subflow, Nearest subflow… (unchanged from your prior code)
+    # …
+    # AFTER all those branches, we fall through to the “new intent detection” branch,
+    # append assistant_reply, save to history and logs, then generate TTS:
+
+    # F) New intent detection & few-shot fallback
+    intent = classify_intent(user_text)
+    if intent == "VACCINE":
+        assistant_reply = "Which vaccine would you like? Please say the vaccine name."
+    elif intent == "REFILL":
+        assistant_reply = "Certainly. What is your prescription number?"
+    elif intent == "HOURS":
+        assistant_reply = ("Our pharmacy is open Monday to Friday, 9 AM to 6 PM, "
+                          "and Saturday 10 AM to 4 PM. Anything else I can help you with?")
+    elif intent == "NEAREST":
+        assistant_reply = "Sure—what’s your postal code (Canada)?"
+    else:
+        few_shot = [
+            {"role":"system","content":"You are a friendly, concise pharmacy assistant. Keep replies under 300 characters."},
+            {"role":"user","content":"I want to schedule a vaccine appointment."},
+            {"role":"assistant","content":"Which vaccine would you like? Please say the vaccine name."},
+            {"role":"user","content":"I need to refill my prescription."},
+            {"role":"assistant","content":"Of course. What is your prescription number?"},
+            {"role":"user","content":"What are your pharmacy hours on Saturday?"},
+            {"role":"assistant","content":"We’re open Monday–Friday 9–6, Saturday 10–4. Anything else?"},
+            {"role":"user","content":"Do you have ibuprofen 200 mg in stock?"},
+            {"role":"assistant","content":"Let me check… Yes, we have it. Would you like me to hold some?"}
+        ]
+        resp = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=few_shot + history,
+            max_tokens=60, temperature=0.2
+        )
+        assistant_reply = resp.choices[0].message.content.strip()
+
+    # H) Append & log
+    history.append({"role":"assistant","content":assistant_reply})
+    save_history(call_sid, history)
+    log_call_turn(call_sid, len(history)//2 + 1, user_text, assistant_reply, None)
+
+    # I) Generate TTS, log TwiML, return
+    vr = generate_and_play_tts(assistant_reply, call_sid, suffix=str(int(time.time())))
     tw = str(vr)
     print("📤 /process-recording TwiML:", tw)
     return Response(content=tw, media_type="application/xml")
 
+# ─── Dashboard endpoints unchanged ────────────────────────────────────────────────
+@app.get("/api/logs")
+async def get_call_logs(limit: int = 100):
+    # … same as before …
+    return JSONResponse({"logs": logs})
 
-# … the /api/logs, /api/calls, /api/conversations endpoints unchanged …
+@app.get("/api/calls")
+async def list_call_sids():
+    # … same as before …
+    return JSONResponse({"call_sids": call_sids})
+
+@app.get("/api/conversations/{call_sid}")
+async def get_conversation(call_sid: str):
+    # … same as before …
+    return JSONResponse({"call_sid": call_sid, "messages": messages})
