@@ -312,7 +312,7 @@ async def process_recording(request: Request):
     # ─── Escalation for urgent/emergency ──────────────────────────────────
     esc_kw = ("urgent","emergency","immediately","asap")
     if any(w in user_speech.lower() for w in esc_kw):
-        esc_reply = "I understand this is an emergency. You are being transferred to a pharmacist now. Please hold."
+        esc_reply = "I understand. You are being transferred to a pharmacist now. Please hold."
         log_call_turn(
             call_sid,
             len(history)//2 + 1,
@@ -390,7 +390,7 @@ async def process_recording(request: Request):
         else:
             few=[{"role":"system","content":"You are a concise pharmacy assistant under 300 chars."}]
             few.append({"role":"user","content":"I want to schedule a vaccine appointment."})
-            few.append({"role":"assistant","content":"Which vaccine would you like? Please say the vaccine name."})
+            few.append({"role":"assistant","content":"Which vaccine would you like?"})
             resp=openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",messages=few+history,temperature=0.2
             )
