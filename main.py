@@ -41,9 +41,11 @@ GOOGLE_MAPS_API_KEY  = os.getenv("GOOGLE_MAPS_API_KEY")
 # ─── Initialize OpenAI client ───────────────────────────────────────────────────
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ─── Static files & DB setup ─────────────────────────────────────────────────────
+# ─── Ensure “static” directory exists (to serve TTS MP3s) ───────────────────────
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# ─── SQLite DB setup ────────────────────────────────────────────────────────────
 DB_PATH = "conversations.db"
 
 def init_db():
@@ -80,13 +82,12 @@ def init_db():
             booked_at       DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    conn.commit()
     # add reprompt_count if missing
     c.execute("PRAGMA table_info(conversations);")
     cols = [r[1] for r in c.fetchall()]
     if "reprompt_count" not in cols:
         c.execute("ALTER TABLE conversations ADD COLUMN reprompt_count INTEGER DEFAULT 0;")
-        conn.commit()
+    conn.commit()
     conn.close()
     print(f"[{datetime.utcnow()}] init_db complete, DB at {os.path.abspath(DB_PATH)}")
 
@@ -216,7 +217,6 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
     tts_filename = f"tts_{call_sid}_{suffix}_{int(time.time())}.mp3"
     tts_filepath = os.path.join("static", tts_filename)
 
-    # Debug env
     print("🔑 ELEVENLABS_API_KEY set?", ELEVENLABS_API_KEY is not None,
           "VOICE_ID:", VOICE_ID)
 
@@ -228,18 +228,16 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
         }
         payload = {
             "text": text,
-            "model_id": "eleven_monolingual_v1",   # try changing this if you still get 400
+            "model_id": "eleven_multilingual_v2",
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
         }
         resp = requests.post(tts_endpoint, json=payload, headers=headers, timeout=10)
         if resp.status_code != 200 or not resp.content:
-            # log full error for diagnosis
             print(f"[{datetime.utcnow()}] ElevenLabs TTS error status {resp.status_code}, body: {resp.text}")
-            raise Exception(f"TTS bad status {resp.status_code}")
+            raise Exception("TTS failed")
         with open(tts_filepath, "wb") as f:
             f.write(resp.content)
 
-        # success → play the MP3
         vr = VoiceResponse()
         gather = vr.gather(
             input="speech",
@@ -251,8 +249,7 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
         return vr
 
     except Exception as e:
-        # fallback: still wrap in a Gather so the call doesn't just drop
-        print(f"[{datetime.utcnow()}] ElevenLabs TTS error: {e}")
+        print(f"[{datetime.utcnow()}] ElevenLabs TTS exception: {e}")
         vr = VoiceResponse()
         gather = vr.gather(
             input="speech",
@@ -260,14 +257,15 @@ def generate_and_play_tts(text: str, call_sid: str, suffix: str="resp") -> Voice
             method="POST",
             speechTimeout="auto"
         )
-        gather.say(text)  
+        gather.say(text)
         return vr
 
 # ─── Incoming Call ──────────────────────────────────────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
     form = await request.form()
-    print("📥 /incoming-call:", dict(form))
+    print("📥 /incoming-call form data:", dict(form))
+
     call_sid = form.get("CallSid")
     if not call_sid:
         return Response(status_code=400)
@@ -275,15 +273,16 @@ async def incoming_call(request: Request):
     reset_reprompt_count(call_sid)
     greeting = "Hello, thank you for calling the pharmacy. How can I help you today?"
     vr = generate_and_play_tts(greeting, call_sid, suffix="greeting")
-    tw = str(vr)
-    print("📤 /incoming-call TwiML:", tw)
-    return Response(content=tw, media_type="application/xml")
+
+    twi = str(vr)
+    print("📤 /incoming-call TwiML:", twi)
+    return Response(content=twi, media_type="application/xml")
 
 # ─── Process Recording ────────────────────────────────────────────────────────────
 @app.post("/process-recording")
 async def process_recording(request: Request):
     form = await request.form()
-    print("📥 /process-recording:", dict(form))
+    print("📥 /process-recording form data:", dict(form))
 
     call_sid    = form.get("CallSid")
     user_speech = form.get("SpeechResult") or ""
@@ -311,8 +310,8 @@ async def process_recording(request: Request):
         else:
             vr.say(text); vr.hangup()
             log_call_turn(call_sid, len(history)//2, None, None, "Silence hangup")
-        tw = str(vr); print("📤 /process-recording TwiML:", tw)
-        return Response(content=tw, media_type="application/xml")
+        twi = str(vr); print("📤 /process-recording TwiML:", twi)
+        return Response(content=twi, media_type="application/xml")
 
     # B) Low confidence
     if confidence < 0.5:
@@ -321,27 +320,20 @@ async def process_recording(request: Request):
         g = vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto")
         g.say(text)
         log_call_turn(call_sid, len(history)//2, user_speech, None, f"Low confidence ({confidence})")
-        tw = str(vr); print("📤 /process-recording TwiML:", tw)
-        return Response(content=tw, media_type="application/xml")
+        twi = str(vr); print("📤 /process-recording TwiML:", twi)
+        return Response(content=twi, media_type="application/xml")
 
-    user_text = user_speech.strip()
-    reset_reprompt_count(call_sid)
-    history.append({"role":"user","content":user_text})
-
-    # Vaccine subflow
+    # C) Vaccine subflow
     last = history[-2]["content"] if len(history)>1 else ""
     if last.startswith("Which vaccine would you like"):
-        # got vaccine
-        history.append({"role":"system","content": json.dumps({"vaccine_type":user_text})})
+        history.append({"role":"system","content":json.dumps({"vaccine_type":user_speech.strip()})})
         reply = "Got it. May I have your full name, please?"
     elif last.startswith("Got it. May I have your full name"):
-        history.append({"role":"system","content": json.dumps({"patient_name":user_text})})
+        history.append({"role":"system","content":json.dumps({"patient_name":user_speech.strip()})})
         reply = "Thank you. On which date would you like to book your appointment? Please say the date."
     elif last.startswith("Thank you. On which date"):
-        # final slot
-        history.append({"role":"system","content": json.dumps({"desired_date":user_text})})
-        # pull slots
-        slots = {}
+        history.append({"role":"system","content":json.dumps({"desired_date":user_speech.strip()})})
+        slots={}
         for m in history:
             if m["role"]=="system":
                 slots.update(json.loads(m["content"]))
@@ -349,68 +341,78 @@ async def process_recording(request: Request):
         reply = (f"Thank you. Your {slots['vaccine_type']} appointment for "
                  f"{slots['patient_name']} on {slots['desired_date']} is booked. Goodbye.")
         vr = generate_and_play_tts(reply, call_sid, suffix="finalv"); vr.hangup()
-        log_call_turn(call_sid, len(history)//2, user_text, reply, "VACCINE_BOOKED")
+        log_call_turn(call_sid, len(history)//2, user_speech, reply, "VACCINE_BOOKED")
         history.append({"role":"assistant","content":reply})
         save_history(call_sid, history)
-        tw = str(vr); print("📤 /process-recording TwiML:", tw)
-        return Response(content=tw, media_type="application/xml")
+        twi = str(vr); print("📤 /process-recording TwiML:", twi)
+        return Response(content=twi, media_type="application/xml")
     else:
-        # new intent
-        intent = classify_intent(user_text)
-        if intent=="VACCINE":
+        intent = classify_intent(user_speech)
+        if intent == "VACCINE":
             reply = "Which vaccine would you like? Please say the vaccine name."
-        # ... other intents unchanged ...
+        elif intent == "REFILL":
+            reply = "Certainly. What is your prescription number?"
+        elif intent == "HOURS":
+            reply = ("Our pharmacy is open Monday to Friday 9 AM to 6 PM, "
+                     "and Saturday 10 AM to 4 PM. Anything else I can help you with?")
+        elif intent == "NEAREST":
+            reply = "Sure—what’s your postal code (Canada)?"
         else:
-            reply = "Sorry, I didn’t understand that. How can I help?"
-    # append & log
+            few_shot = [
+                {"role":"system","content":"You are a concise pharmacy assistant under 300 chars."},
+                {"role":"user","content":"I want to schedule a vaccine appointment."},
+                {"role":"assistant","content":"Which vaccine would you like? Please say the vaccine name."},
+                {"role":"user","content":"I need to refill my prescription."},
+                {"role":"assistant","content":"Of course. What is your prescription number?"},
+                {"role":"user","content":"What are your pharmacy hours on Saturday?"},
+                {"role":"assistant","content":"We’re open M–F 9–6, Sat 10–4."},
+                {"role":"user","content":"Do you have ibuprofen 200 mg in stock?"},
+                {"role":"assistant","content":"Yes. Would you like me to hold some?"}
+            ]
+            resp = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=few_shot+history,
+                max_tokens=60, temperature=0.2
+            )
+            reply = resp.choices[0].message.content.strip()
+
     history.append({"role":"assistant","content":reply})
     save_history(call_sid, history)
-    log_call_turn(call_sid, len(history)//2, user_text, reply, None)
+    log_call_turn(call_sid, len(history)//2, user_speech, reply, None)
 
-    # respond
     vr = generate_and_play_tts(reply, call_sid, suffix=str(int(time.time())))
-    tw = str(vr); print("📤 /process-recording TwiML:", tw)
-    return Response(content=tw, media_type="application/xml")
+    twi = str(vr)
+    print("📤 /process-recording TwiML:", twi)
+    return Response(content=twi, media_type="application/xml")
 
 # ─── Enhanced /api/logs ───────────────────────────────────────────────────────────
 @app.get("/api/logs")
 async def get_call_logs(limit: int = 100):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("""
-            SELECT id, call_sid, turn_number, user_text,
-                   assistant_reply, error_message, timestamp
-            FROM call_logs
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (limit,))
-        rows = c.fetchall()
-        logs = []
-        for r in rows:
-            log = dict(zip(
-                ["id","call_sid","turn_number","user_text","assistant_reply","error_message","timestamp"],
-                r
-            ))
-            # attach full transcript
-            c.execute("SELECT messages FROM conversations WHERE call_sid = ?;", (log["call_sid"],))
-            mrow = c.fetchone()
-            log["transcript"] = json.loads(mrow[0]) if mrow else []
-            # attach booking if any
-            c.execute("""
-                SELECT vaccine_type,patient_name,desired_date,booked_at 
-                FROM bookings WHERE call_sid = ?;
-            """, (log["call_sid"],))
-            brow = c.fetchone()
-            log["booking"] = dict(zip(
-                ["vaccine_type","patient_name","desired_date","booked_at"], brow
-            )) if brow else None
-            logs.append(log)
-        conn.close()
-        return JSONResponse({"logs": logs})
-    except Exception as e:
-        print("Error in /api/logs:", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, call_sid, turn_number, user_text,
+               assistant_reply, error_message, timestamp
+          FROM call_logs
+         ORDER BY timestamp DESC
+         LIMIT ?
+    """, (limit,))
+    rows = c.fetchall()
+    logs = []
+    for r in rows:
+        log = dict(zip(
+            ["id","call_sid","turn_number","user_text","assistant_reply","error_message","timestamp"],
+            r
+        ))
+        c.execute("SELECT messages FROM conversations WHERE call_sid = ?;", (log["call_sid"],))
+        m = c.fetchone()
+        log["transcript"] = json.loads(m[0]) if m else []
+        c.execute("SELECT vaccine_type,patient_name,desired_date,booked_at FROM bookings WHERE call_sid = ?;", (log["call_sid"],))
+        b = c.fetchone()
+        log["booking"] = dict(zip(["vaccine_type","patient_name","desired_date","booked_at"], b)) if b else None
+        logs.append(log)
+    conn.close()
+    return JSONResponse({"logs": logs})
 
 @app.get("/api/calls")
 async def list_call_sids():
