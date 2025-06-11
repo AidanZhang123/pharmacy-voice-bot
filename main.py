@@ -333,7 +333,7 @@ async def process_recording(request: Request):
                 {"role":"user","content":"Do you have ibuprofen?"}
             ]
             out = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo", messages=few+hist, max_tokens=60
+                model="gpt-3.5-turbo", messages=few+hist
             )
             reply = out.choices[0].message.content.strip()
 
