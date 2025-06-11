@@ -29,10 +29,10 @@ DB_PATH = "conversations.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS conversations (call_sid TEXT PRIMARY KEY,messages TEXT,reprompt_count INTEGER DEFAULT 0);")
-    c.execute("CREATE TABLE IF NOT EXISTS call_logs (id INTEGER PRIMARY KEY AUTOINCREMENT,call_sid TEXT,turn_number INTEGER,user_text TEXT,assistant_reply TEXT,error_message TEXT,timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);")
-    c.execute("CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY AUTOINCREMENT,call_sid TEXT,vaccine_type TEXT,patient_name TEXT,desired_date TEXT,booked_at DATETIME DEFAULT CURRENT_TIMESTAMP);")
-    c.execute("CREATE TABLE IF NOT EXISTS call_metadata (call_sid TEXT PRIMARY KEY,from_number TEXT,from_city TEXT,from_state TEXT,from_zip TEXT,from_country TEXT);")
+    c.execute("CREATE TABLE IF NOT EXISTS conversations(call_sid TEXT PRIMARY KEY,messages TEXT,reprompt_count INTEGER DEFAULT 0);")
+    c.execute("CREATE TABLE IF NOT EXISTS call_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,call_sid TEXT,turn_number INTEGER,user_text TEXT,assistant_reply TEXT,error_message TEXT,timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);")
+    c.execute("CREATE TABLE IF NOT EXISTS bookings(id INTEGER PRIMARY KEY AUTOINCREMENT,call_sid TEXT,vaccine_type TEXT,patient_name TEXT,desired_date TEXT,booked_at DATETIME DEFAULT CURRENT_TIMESTAMP);")
+    c.execute("CREATE TABLE IF NOT EXISTS call_metadata(call_sid TEXT PRIMARY KEY,from_number TEXT,from_city TEXT,from_state TEXT,from_zip TEXT,from_country TEXT);")
     c.execute("PRAGMA table_info(conversations);")
     if "reprompt_count" not in [r[1] for r in c.fetchall()]:
         c.execute("ALTER TABLE conversations ADD COLUMN reprompt_count INTEGER DEFAULT 0;")
@@ -42,13 +42,13 @@ def init_db():
 init_db()
 
 # ─── SQLite Helpers ─────────────────────────────────────────────────────────────
-def retry_sqlite(func,*a,**k):
+def retry_sqlite(f,*a,**k):
     for _ in range(3):
-        try: return func(*a,**k)
+        try: return f(*a,**k)
         except sqlite3.OperationalError as e:
             if "locked" in str(e): time.sleep(0.1)
             else: raise
-    return func(*a,**k)
+    return f(*a,**k)
 
 def get_history(sid):
     def _():
@@ -124,12 +124,10 @@ def generate_and_play_tts(text,sid,suffix="resp"):
         r=requests.post(url,json=pl,headers=hd,timeout=10)
         if r.status_code!=200 or not r.content: raise Exception(f"TTS {r.status_code}")
         with open(fp,"wb") as f: f.write(r.content)
-        vr=VoiceResponse()
-        g=vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto")
+        vr=VoiceResponse(); g=vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto")
         g.play(f"{BASE_URL}/static/{fn}"); return vr
-    except Exception:
-        vr=VoiceResponse()
-        g=vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto")
+    except:
+        vr=VoiceResponse(); g=vr.gather(input="speech",action=f"{BASE_URL}/process-recording",method="POST",speechTimeout="auto")
         g.say(text); return vr
 
 # ─── Incoming Call ──────────────────────────────────────────────────────────────
@@ -157,16 +155,16 @@ async def process_recording(req:Request):
     if not sid: return Response(status_code=400)
     history=get_history(sid); reps=get_reprompt_count(sid)
 
-    # Escalation...
+    # Emergency escalation
     for kw in ("urgent","emergency","immediately","asap"):
         if kw in us.lower():
-            esc="Emergency observed; transferring you to a pharmacist now."
+            esc="Emergency observed; transferring to pharmacist now."
             log_call_turn(sid,len(history)//2+1,us,esc,"EMERGENCY_OBSERVED")
             history.append({"role":"assistant","content":esc}); save_history(sid,history)
             vr=generate_and_play_tts(esc,sid,"escalation"); vr.hangup()
             return Response(content=str(vr),media_type="application/xml")
 
-    # Silence
+    # Silence reprompt
     if not us.strip():
         msg=reps<3 and "Sorry, I didn’t hear anything. Could you repeat?" or "Goodbye."
         vr=generate_and_play_tts(msg,sid,reps<3 and "reprompt" or "hangup")
@@ -177,99 +175,102 @@ async def process_recording(req:Request):
         tw=str(vr); print("📤 process-recording TwiML:",tw)
         return Response(content=tw,media_type="application/xml")
 
-    # Low confidence
+    # Low-confidence reprompt
     if conf<0.5:
-        msg="Sorry, I didn’t catch that. Could you repeat?"
+        msg="Sorry, I didn’t catch that clearly. Could you repeat?"
         vr=generate_and_play_tts(msg,sid,"reprompt_low")
         log_call_turn(sid,len(history)//2,us,None,f"Low confidence ({conf})")
         tw=str(vr); print("📤 process-recording TwiML:",tw)
         return Response(content=tw,media_type="application/xml")
 
-    # Add user
+    # Add user utterance
     history.append({"role":"user","content":us.strip()})
     reset_reprompt_count(sid)
 
-    # Determine last assistant
-    last=""
-    for m in reversed(history):
-        if m["role"]=="assistant":
-            last=m["content"]; break
+    # Get last assistant prompt
+    last_assistant = next((m["content"] for m in reversed(history) if m["role"]=="assistant"), "")
 
     # Vaccine flow
-    if last=="Sure! Which vaccine would you like?":
-        vt=us.strip()
-        history.append({"role":"system","content":json.dumps({"vaccine_type":vt})})
-        assistant_reply="Got it. May I have your full name?"
-    elif last=="Got it. May I have your full name?":
-        pn=us.strip()
-        history.append({"role":"system","content":json.dumps({"patient_name":pn})})
-        assistant_reply="Thank you. On which date would you like to book your appointment?"
-    elif last.startswith("Thank you. On which date"):
-        dd=us.strip()
-        history.append({"role":"system","content":json.dumps({"desired_date":dd})})
-        slots={}
+    if last_assistant == "Sure! Which vaccine would you like?":
+        # record vaccine
+        history.append({"role":"system","content":json.dumps({"vaccine_type": us.strip()})})
+        assistant_reply = "Got it. May I have your full name?"
+    elif last_assistant == "Got it. May I have your full name?":
+        # record name
+        history.append({"role":"system","content":json.dumps({"patient_name": us.strip()})})
+        assistant_reply = "Thank you. On which date would you like to book your appointment?"
+    elif last_assistant.startswith("Thank you. On which date"):
+        # record date & confirm
+        history.append({"role":"system","content":json.dumps({"desired_date": us.strip()})})
+        slots = {}
         for m in history:
             if m["role"]=="system":
                 slots.update(json.loads(m["content"]))
-        save_booking(sid,slots["vaccine_type"],slots["patient_name"],slots["desired_date"])
-        assistant_reply=(f"Thank you. Your {slots['vaccine_type']} appointment for "
-                         f"{slots['patient_name']} on {slots['desired_date']} is booked. Goodbye.")
-        vr=generate_and_play_tts(assistant_reply,sid,"finalv"); vr.hangup()
-        log_call_turn(sid,len(history)//2,us,assistant_reply,"VACCINE_BOOKED")
-        history.append({"role":"assistant","content":assistant_reply}); save_history(sid,history)
-        tw=str(vr); print("📤 process-recording TwiML:",tw)
-        return Response(content=tw,media_type="application/xml")
+        assistant_reply = (f"Thank you. Your {slots['vaccine_type']} appointment for "
+                           f"{slots['patient_name']} on {slots['desired_date']} is booked. Goodbye.")
+        save_booking(sid, slots["vaccine_type"], slots["patient_name"], slots["desired_date"])
+        log_call_turn(sid, len(history)//2+1, us, assistant_reply, "VACCINE_BOOKED")
+        history.append({"role":"assistant","content":assistant_reply})
+        save_history(sid, history)
+        vr = generate_and_play_tts(assistant_reply, sid, "finalv")
+        vr.hangup()
+        tw = str(vr); print("📤 process-recording TwiML:", tw)
+        return Response(content=tw, media_type="application/xml")
     else:
-        # New intent detection
-        intent=classify_intent(us)
-        if intent=="VACCINE":
-            assistant_reply="Sure! Which vaccine would you like?"
-        elif intent=="REFILL":
-            assistant_reply="Sure! What is your prescription number?"
-        elif intent=="HOURS":
-            assistant_reply="We’re open Monday–Friday 9–6, Saturday 10–4."
-        elif intent=="NEAREST":
-            assistant_reply="Sure! What’s your postal code?"
+        # New intent
+        intent = classify_intent(us)
+        if intent == "VACCINE":
+            assistant_reply = "Sure! Which vaccine would you like?"
+        elif intent == "REFILL":
+            assistant_reply = "Sure! What is your prescription number?"
+        elif intent == "HOURS":
+            assistant_reply = "We’re open Monday–Friday 9 AM–6 PM, and Saturday 10 AM–4 PM."
+        elif intent == "NEAREST":
+            assistant_reply = "Sure! What’s your postal code?"
         else:
-            few=[{"role":"system","content":"You are concise; keep replies under 300 characters."}]
-            resp=openai_client.chat.completions.create(model="gpt-3.5-turbo",messages=few+history,temperature=0.2)
-            assistant_reply=resp.choices[0].message.content.strip()
+            few = [{"role":"system","content":"You’re a concise pharmacy assistant under 300 characters."}]
+            resp = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo", messages=few+history, temperature=0.2
+            )
+            assistant_reply = resp.choices[0].message.content.strip()
 
-    # Append & log
+    # Append & log the assistant reply
     history.append({"role":"assistant","content":assistant_reply})
-    save_history(sid,history)
-    log_call_turn(sid,len(history)//2,us,assistant_reply,None)
+    save_history(sid, history)
+    log_call_turn(sid, len(history)//2, us, assistant_reply, None)
 
-    vr=generate_and_play_tts(assistant_reply,sid,str(int(time.time())))
-    tw=str(vr); print("📤 process-recording TwiML:",tw)
-    return Response(content=tw,media_type="application/xml")
+    # Generate TTS and return
+    vr = generate_and_play_tts(assistant_reply, sid, str(int(time.time())))
+    tw = str(vr); print("📤 process-recording TwiML:", tw)
+    return Response(content=tw, media_type="application/xml")
 
+# ─── /api/logs ─────────────────────────────────────────────────────────────────
 @app.get("/api/logs")
 async def get_call_logs(limit:int=100):
     conn=sqlite3.connect(DB_PATH); c=conn.cursor()
     c.execute("SELECT id,call_sid,turn_number,user_text,assistant_reply,error_message,timestamp FROM call_logs ORDER BY timestamp DESC LIMIT ?;",(limit,))
     rows=c.fetchall(); logs=[]
     for r in rows:
-        log=dict(zip(["id","call_sid","turn_number","user_text","assistant_reply","error_message","timestamp"],r))
-        c.execute("SELECT messages FROM conversations WHERE call_sid=?;",(log["call_sid"],))
-        m=c.fetchone(); log["transcript"]=json.loads(m[0]) if m else []
-        c.execute("SELECT vaccine_type,patient_name,desired_date,booked_at FROM bookings WHERE call_sid=?;",(log["call_sid"],))
-        b=c.fetchone(); log["booking"]=dict(zip(["vaccine_type","patient_name","desired_date","booked_at"],b)) if b else None
-        c.execute("SELECT from_number,from_city,from_state,from_zip,from_country FROM call_metadata WHERE call_sid=?;",(log["call_sid"],))
-        md=c.fetchone(); log["metadata"]=dict(zip(["from_number","from_city","from_state","from_zip","from_country"],md)) if md else {}
+        log = dict(zip(["id","call_sid","turn_number","user_text","assistant_reply","error_message","timestamp"], r))
+        c.execute("SELECT messages FROM conversations WHERE call_sid=?;", (log["call_sid"],))
+        m = c.fetchone(); log["transcript"] = json.loads(m[0]) if m else []
+        c.execute("SELECT vaccine_type,patient_name,desired_date,booked_at FROM bookings WHERE call_sid=?;", (log["call_sid"],))
+        b = c.fetchone(); log["booking"] = dict(zip(["vaccine_type","patient_name","desired_date","booked_at"], b)) if b else None
+        c.execute("SELECT from_number,from_city,from_state,from_zip,from_country FROM call_metadata WHERE call_sid=?;", (log["call_sid"],))
+        md = c.fetchone(); log["metadata"] = dict(zip(["from_number","from_city","from_state","from_zip","from_country"], md)) if md else {}
         logs.append(log)
-    conn.close(); return JSONResponse({"logs":logs})
+    conn.close(); return JSONResponse({"logs": logs})
 
 @app.get("/api/calls")
 async def list_call_sids():
     conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("SELECT call_sid FROM conversations;"); s=[r[0] for r in c.fetchall()]
-    conn.close(); return JSONResponse({"call_sids":s})
+    c.execute("SELECT call_sid FROM conversations;"); sids=[r[0] for r in c.fetchall()]
+    conn.close(); return JSONResponse({"call_sids": sids})
 
 @app.get("/api/conversations/{call_sid}")
 async def get_conversation(call_sid:str):
     conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-    c.execute("SELECT messages FROM conversations WHERE call_sid=?;",(call_sid,))
+    c.execute("SELECT messages FROM conversations WHERE call_sid=?;", (call_sid,))
     row=c.fetchone(); conn.close()
-    if not row: return JSONResponse({"error":"CallSid not found"},status_code=404)
-    return JSONResponse({"call_sid":call_sid,"messages":json.loads(row[0])})
+    if not row: return JSONResponse({"error":"CallSid not found"}, status_code=404)
+    return JSONResponse({"call_sid": call_sid, "messages": json.loads(row[0])})
