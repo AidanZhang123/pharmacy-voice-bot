@@ -17,12 +17,11 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
-    allow_headers=["*"], allow_credentials=True
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
 print(
-    "Startup:", 
+    "Startup:",
     "ELEVENLABS_API_KEY?", os.getenv("ELEVENLABS_API_KEY") is not None,
     "VOICE_ID:", os.getenv("ELEVENLABS_VOICE_ID")
 )
@@ -41,7 +40,6 @@ DB_PATH = "conversations.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    # conversation history + reprompts
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             call_sid TEXT PRIMARY KEY,
@@ -49,7 +47,6 @@ def init_db():
             reprompt_count INTEGER DEFAULT 0
         );
     """)
-    # per-turn logs
     c.execute("""
         CREATE TABLE IF NOT EXISTS call_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +58,6 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # bookings
     c.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +68,6 @@ def init_db():
             booked_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # caller metadata
     c.execute("""
         CREATE TABLE IF NOT EXISTS call_metadata (
             call_sid TEXT PRIMARY KEY,
@@ -92,16 +87,16 @@ def init_db():
 init_db()
 
 # ─── SQLite helpers ───────────────────────────────────────────────────────────────
-def retry_sqlite(f,*a,**k):
+def retry_sqlite(f, *a, **k):
     for _ in range(3):
         try:
-            return f(*a,**k)
+            return f(*a, **k)
         except sqlite3.OperationalError as e:
             if "locked" in str(e):
                 time.sleep(0.1)
             else:
                 raise
-    return f(*a,**k)
+    return f(*a, **k)
 
 def get_history(sid):
     def _():
@@ -184,7 +179,6 @@ def save_booking(sid, vt, pn, dd):
 # ─── Intent classification ────────────────────────────────────────────────────────
 def classify_intent(text: str) -> str:
     l = text.lower()
-    # vaccination + booking verbs
     if (("vaccine" in l or "vaccination" in l) and
         ("book" in l or "schedule" in l or "appointment" in l)) \
        or any(kw in l for kw in ["vaccine","vaccination","shot"]):
@@ -245,7 +239,7 @@ async def incoming_call(request: Request):
     form = await request.form()
     print("📥 incoming-call:", dict(form))
     sid = form.get("CallSid")
-    # store caller metadata
+    # store metadata
     meta = (
         sid,
         form.get("From"), form.get("FromCity"),
@@ -299,7 +293,7 @@ async def process_recording(request: Request):
             vr.hangup()
             return Response(content=str(vr), media_type="application/xml")
 
-    # 2) Silence reprompts (up to 3)
+    # 2) Silence reprompt (always up to 3)
     if not us.strip():
         if reps < 3:
             increment_reprompt_count(sid)
@@ -325,11 +319,11 @@ async def process_recording(request: Request):
         tw = str(vr); print("📤 low-conf TwiML:", tw)
         return Response(content=tw, media_type="application/xml")
 
-    # record the valid user turn
+    # record valid user turn
     history.append({"role":"user","content":us.strip()})
     reset_reprompt_count(sid)
 
-    # rebuild slot_data from prior system messages
+    # rebuild slot_data
     slot_data = {}
     for m in history:
         if m["role"] == "system":
@@ -338,19 +332,19 @@ async def process_recording(request: Request):
             except:
                 pass
 
-    # exact dialogue strings for booking flow
+    # booking prompts
     Q1 = "Sure! Which vaccine would you like?"
     Q2 = "Got it. May I have your full name?"
     Q3 = "Thank you. On which date would you like to book your appointment?"
 
-    # find the last assistant prompt
+    # get last assistant
     last_assistant = next(
-        (m["content"] for m in reversed(history) if m["role"] == "assistant"),
+        (m["content"] for m in reversed(history) if m["role"]=="assistant"),
         ""
     )
 
-    # 4) Vaccine booking slot flow, guaranteed three steps
-    if "vaccine_type" not in slot_data and classify_intent(us) == "VACCINE":
+    # 4) Vaccine booking flow
+    if "vaccine_type" not in slot_data and classify_intent(us) == "VACCINE" and last_assistant != Q1:
         assistant_reply = Q1
 
     elif last_assistant == Q1:
@@ -379,7 +373,7 @@ async def process_recording(request: Request):
         return Response(content=tw, media_type="application/xml")
 
     else:
-        # 5) Other intents or GPT fallback
+        # 5) Other intents / GPT fallback
         intent = classify_intent(us)
         if intent == "REFILL":
             assistant_reply = "Sure! What is your prescription number?"
@@ -396,12 +390,12 @@ async def process_recording(request: Request):
             )
             assistant_reply = resp.choices[0].message.content.strip()
 
-    # append & log the assistant reply
+    # append & log reply
     history.append({"role":"assistant","content":assistant_reply})
     save_history(sid, history)
     log_call_turn(sid, len(history)//2, us, assistant_reply, None)
 
-    # generate TTS and return
+    # respond
     vr = generate_and_play_tts(assistant_reply, sid, str(int(time.time())))
     tw = str(vr); print("📤 response TwiML:", tw)
     return Response(content=tw, media_type="application/xml")
