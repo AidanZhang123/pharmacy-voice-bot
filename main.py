@@ -1,5 +1,10 @@
-import os, time, json, sqlite3, requests
+import os
+import time
+import json
+import sqlite3
+import requests
 from datetime import datetime
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
@@ -12,12 +17,15 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+    allow_headers=["*"], allow_credentials=True
 )
 
-print("Startup:", 
-      "ELEVENLABS_API_KEY?", os.getenv("ELEVENLABS_API_KEY") is not None,
-      "VOICE_ID:", os.getenv("ELEVENLABS_VOICE_ID"))
+print(
+    "Startup:", 
+    "ELEVENLABS_API_KEY?", os.getenv("ELEVENLABS_API_KEY") is not None,
+    "VOICE_ID:", os.getenv("ELEVENLABS_VOICE_ID")
+)
 
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY")
@@ -33,6 +41,7 @@ DB_PATH = "conversations.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    # conversation history + reprompts
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             call_sid TEXT PRIMARY KEY,
@@ -40,6 +49,7 @@ def init_db():
             reprompt_count INTEGER DEFAULT 0
         );
     """)
+    # per-turn logs
     c.execute("""
         CREATE TABLE IF NOT EXISTS call_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +61,7 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # bookings
     c.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +72,7 @@ def init_db():
             booked_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # caller metadata
     c.execute("""
         CREATE TABLE IF NOT EXISTS call_metadata (
             call_sid TEXT PRIMARY KEY,
@@ -82,10 +94,13 @@ init_db()
 # ─── SQLite helpers ───────────────────────────────────────────────────────────────
 def retry_sqlite(f,*a,**k):
     for _ in range(3):
-        try: return f(*a,**k)
+        try:
+            return f(*a,**k)
         except sqlite3.OperationalError as e:
-            if "locked" in str(e): time.sleep(0.1)
-            else: raise
+            if "locked" in str(e):
+                time.sleep(0.1)
+            else:
+                raise
     return f(*a,**k)
 
 def get_history(sid):
@@ -104,10 +119,13 @@ def get_history(sid):
         return msgs
     return retry_sqlite(_)
 
-def save_history(sid,msgs):
+def save_history(sid, msgs):
     def _():
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("UPDATE conversations SET messages=? WHERE call_sid=?;", (json.dumps(msgs), sid))
+        c.execute(
+            "UPDATE conversations SET messages=? WHERE call_sid=?;",
+            (json.dumps(msgs), sid)
+        )
         conn.commit(); conn.close()
     retry_sqlite(_)
 
@@ -117,67 +135,78 @@ def get_reprompt_count(sid):
         c.execute("SELECT reprompt_count FROM conversations WHERE call_sid=?;", (sid,))
         row = c.fetchone(); conn.close()
         return row[0] if row else 0
-    except: return 0
+    except:
+        return 0
 
 def increment_reprompt_count(sid):
     def _():
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("UPDATE conversations SET reprompt_count=reprompt_count+1 WHERE call_sid=?;", (sid,))
+        c.execute(
+            "UPDATE conversations SET reprompt_count=reprompt_count+1 WHERE call_sid=?;",
+            (sid,)
+        )
         conn.commit(); conn.close()
     retry_sqlite(_)
 
 def reset_reprompt_count(sid):
     def _():
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("UPDATE conversations SET reprompt_count=0 WHERE call_sid=?;", (sid,))
+        c.execute(
+            "UPDATE conversations SET reprompt_count=0 WHERE call_sid=?;",
+            (sid,)
+        )
         conn.commit(); conn.close()
     retry_sqlite(_)
 
-def log_call_turn(sid,turn,ut,ar,err):
+def log_call_turn(sid, turn, ut, ar, err):
     def _():
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("""
             INSERT INTO call_logs(
                 call_sid, turn_number, user_text,
                 assistant_reply, error_message
-            ) VALUES(?,?,?,?,?);
+            ) VALUES (?,?,?,?,?);
         """, (sid, turn, ut, ar, err))
         conn.commit(); conn.close()
     retry_sqlite(_)
 
-def save_booking(sid,vt,pn,dd):
+def save_booking(sid, vt, pn, dd):
     def _():
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("""
-            INSERT INTO bookings(call_sid,vaccine_type,patient_name,desired_date)
-            VALUES(?,?,?,?);
+            INSERT INTO bookings(
+                call_sid, vaccine_type, patient_name, desired_date
+            ) VALUES (?,?,?,?);
         """, (sid, vt, pn, dd))
         conn.commit(); conn.close()
     retry_sqlite(_)
 
-# ─── Intent classification (enhanced) ─────────────────────────────────────────────
+# ─── Intent classification ────────────────────────────────────────────────────────
 def classify_intent(text: str) -> str:
-    lower = text.lower()
-    # catch vaccination synonyms + booking verbs
-    if (("vaccine" in lower or "vaccination" in lower) and
-        ( "book" in lower or "schedule" in lower or "appointment" in lower )
-       ) or any(kw in lower for kw in ["vaccine","vaccination","shot"]):
+    l = text.lower()
+    # vaccination + booking verbs
+    if (("vaccine" in l or "vaccination" in l) and
+        ("book" in l or "schedule" in l or "appointment" in l)) \
+       or any(kw in l for kw in ["vaccine","vaccination","shot"]):
         return "VACCINE"
-    if any(kw in lower for kw in ["refill","renew","prescription"]):
+    if any(kw in l for kw in ["refill","renew","prescription"]):
         return "REFILL"
-    if any(kw in lower for kw in ["hour","open","close","time"]):
+    if any(kw in l for kw in ["hour","open","close","time"]):
         return "HOURS"
-    if "pharmacy" in lower:
+    if "pharmacy" in l:
         return "NEAREST"
     return "GENERAL"
 
-# ─── ElevenLabs TTS helper ─────────────────────────────────────────────────────────
+# ─── ElevenLabs TTS helper ───────────────────────────────────────────────────────
 def generate_and_play_tts(text: str, sid: str, suffix: str="resp") -> VoiceResponse:
     fn = f"tts_{sid}_{suffix}_{int(time.time())}.mp3"
     fp = os.path.join("static", fn)
     try:
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+        }
         payload = {
             "text": text,
             "model_id": "eleven_multilingual_v2",
@@ -199,7 +228,7 @@ def generate_and_play_tts(text: str, sid: str, suffix: str="resp") -> VoiceRespo
         g.play(f"{BASE_URL}/static/{fn}")
         return vr
 
-    except Exception as e:
+    except Exception:
         vr = VoiceResponse()
         g = vr.gather(
             input="speech",
@@ -210,13 +239,13 @@ def generate_and_play_tts(text: str, sid: str, suffix: str="resp") -> VoiceRespo
         g.say(text)
         return vr
 
-# ─── /incoming-call ───────────────────────────────────────────────────────────────
+# ─── /incoming-call ──────────────────────────────────────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
-    form = await request.form(); data = dict(form)
-    print("📥 incoming-call:", data)
+    form = await request.form()
+    print("📥 incoming-call:", dict(form))
     sid = form.get("CallSid")
-    # save caller metadata
+    # store caller metadata
     meta = (
         sid,
         form.get("From"), form.get("FromCity"),
@@ -225,9 +254,10 @@ async def incoming_call(request: Request):
     )
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("""
-        INSERT OR REPLACE INTO call_metadata
-        (call_sid,from_number,from_city,from_state,from_zip,from_country)
-        VALUES(?,?,?,?,?,?);
+        INSERT OR REPLACE INTO call_metadata(
+            call_sid, from_number, from_city,
+            from_state, from_zip, from_country
+        ) VALUES (?,?,?,?,?,?);
     """, meta)
     conn.commit(); conn.close()
 
@@ -243,8 +273,10 @@ async def incoming_call(request: Request):
 # ─── /process-recording ──────────────────────────────────────────────────────────
 @app.post("/process-recording")
 async def process_recording(request: Request):
-    form = await request.form(); data = dict(form)
+    form = await request.form()
+    data = dict(form)
     print("📥 process-recording:", data)
+
     sid = form.get("CallSid")
     us  = form.get("SpeechResult") or ""
     cf  = form.get("Confidence")
@@ -256,7 +288,7 @@ async def process_recording(request: Request):
     history = get_history(sid)
     reps    = get_reprompt_count(sid)
 
-    # 1) emergency detection
+    # 1) Emergency detection
     for kw in ("urgent","emergency","immediately","asap"):
         if kw in us.lower():
             esc = "Emergency observed; transferring you to a pharmacist now."
@@ -267,86 +299,111 @@ async def process_recording(request: Request):
             vr.hangup()
             return Response(content=str(vr), media_type="application/xml")
 
-    # 2) silence
+    # 2) Silence reprompts (up to 3)
     if not us.strip():
-        msg = reps < 3 and "Sorry, I didn’t hear anything. Could you repeat?" or "We did not receive any input. Goodbye."
-        vr = generate_and_play_tts(msg, sid, reps < 3 and "reprompt" or "hangup")
         if reps < 3:
             increment_reprompt_count(sid)
+            msg = "Sorry, I didn’t hear anything. Could you please repeat?"
             log_call_turn(sid, len(history)//2, None, None, "Silence reprompt")
+            vr = generate_and_play_tts(msg, sid, "reprompt_silence")
+            tw = str(vr); print("📤 reprompt TwiML:", tw)
+            return Response(content=tw, media_type="application/xml")
         else:
+            msg = "We did not receive any input. Goodbye."
             log_call_turn(sid, len(history)//2, None, None, "Silence hangup")
+            vr = VoiceResponse()
+            vr.say(msg)
             vr.hangup()
-        tw = str(vr); print("📤 process-recording TwiML:", tw)
-        return Response(content=tw, media_type="application/xml")
+            tw = str(vr); print("📤 hangup TwiML:", tw)
+            return Response(content=tw, media_type="application/xml")
 
-    # 3) low-confidence
+    # 3) Low-confidence reprompt
     if conf < 0.5:
-        msg = "Sorry, I didn’t catch that clearly. Could you repeat?"
-        vr = generate_and_play_tts(msg, sid, "reprompt_low")
+        msg = "Sorry, I didn’t catch that clearly. Could you please repeat?"
         log_call_turn(sid, len(history)//2, us, None, f"Low confidence ({conf})")
-        tw = str(vr); print("📤 process-recording TwiML:", tw)
+        vr = generate_and_play_tts(msg, sid, "reprompt_conf")
+        tw = str(vr); print("📤 low-conf TwiML:", tw)
         return Response(content=tw, media_type="application/xml")
 
-    # record user turn
+    # record the valid user turn
     history.append({"role":"user","content":us.strip()})
     reset_reprompt_count(sid)
 
-    # get last assistant prompt
-    last_assistant = next((m["content"] for m in reversed(history) if m["role"]=="assistant"), "")
+    # rebuild slot_data from prior system messages
+    slot_data = {}
+    for m in history:
+        if m["role"] == "system":
+            try:
+                slot_data.update(json.loads(m["content"]))
+            except:
+                pass
 
-    # 4) vaccine slot flow—exactly three steps
-    if last_assistant == "Sure! Which vaccine would you like?":
+    # exact dialogue strings for booking flow
+    Q1 = "Sure! Which vaccine would you like?"
+    Q2 = "Got it. May I have your full name?"
+    Q3 = "Thank you. On which date would you like to book your appointment?"
+
+    # find the last assistant prompt
+    last_assistant = next(
+        (m["content"] for m in reversed(history) if m["role"] == "assistant"),
+        ""
+    )
+
+    # 4) Vaccine booking slot flow, guaranteed three steps
+    if "vaccine_type" not in slot_data and classify_intent(us) == "VACCINE":
+        assistant_reply = Q1
+
+    elif last_assistant == Q1:
         history.append({"role":"system","content": json.dumps({"vaccine_type": us.strip()})})
-        assistant_reply = "Got it. May I have your full name?"
-    elif last_assistant == "Got it. May I have your full name?":
+        assistant_reply = Q2
+
+    elif "vaccine_type" in slot_data and "patient_name" not in slot_data and last_assistant == Q2:
         history.append({"role":"system","content": json.dumps({"patient_name": us.strip()})})
-        assistant_reply = "Thank you. On which date would you like to book your appointment?"
-    elif last_assistant.startswith("Thank you. On which date"):
+        assistant_reply = Q3
+
+    elif "vaccine_type" in slot_data and "patient_name" in slot_data and last_assistant == Q3:
         history.append({"role":"system","content": json.dumps({"desired_date": us.strip()})})
-        slots = {}
-        for m in history:
-            if m["role"] == "system":
-                slots.update(json.loads(m["content"]))
+        vt = slot_data["vaccine_type"]
+        pn = slot_data["patient_name"]
+        dd = us.strip()
+        save_booking(sid, vt, pn, dd)
         assistant_reply = (
-            f"Thank you. Your {slots['vaccine_type']} appointment for "
-            f"{slots['patient_name']} on {slots['desired_date']} is booked. Goodbye."
+            f"Thank you. Your {vt} appointment for {pn} on {dd} is booked. Goodbye."
         )
-        save_booking(sid, slots["vaccine_type"], slots["patient_name"], slots["desired_date"])
         log_call_turn(sid, len(history)//2+1, us, assistant_reply, "VACCINE_BOOKED")
         history.append({"role":"assistant","content":assistant_reply})
         save_history(sid, history)
         vr = generate_and_play_tts(assistant_reply, sid, "finalv")
         vr.hangup()
-        tw = str(vr); print("📤 process-recording TwiML:", tw)
+        tw = str(vr); print("📤 final TwiML:", tw)
         return Response(content=tw, media_type="application/xml")
 
-    # 5) new intent detection (booking first)
-    intent = classify_intent(us)
-    if intent == "VACCINE":
-        assistant_reply = "Sure! Which vaccine would you like?"
-    elif intent == "REFILL":
-        assistant_reply = "Sure! What is your prescription number?"
-    elif intent == "HOURS":
-        assistant_reply = "We’re open Monday–Friday 9 AM–6 PM, and Saturday 10 AM–4 PM."
-    elif intent == "NEAREST":
-        assistant_reply = "Sure! What’s your postal code?"
     else:
-        fewshot = [{"role":"system","content":"You’re a concise pharmacy assistant—keep replies under 300 characters."}]
-        gpt = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=fewshot + history,
-            temperature=0.2
-        )
-        assistant_reply = gpt.choices[0].message.content.strip()
+        # 5) Other intents or GPT fallback
+        intent = classify_intent(us)
+        if intent == "REFILL":
+            assistant_reply = "Sure! What is your prescription number?"
+        elif intent == "HOURS":
+            assistant_reply = "We’re open Monday–Friday 9 AM–6 PM, and Saturday 10 AM–4 PM."
+        elif intent == "NEAREST":
+            assistant_reply = "Sure! What’s your postal code?"
+        else:
+            few = [{"role":"system","content":"You’re a concise pharmacy assistant—keep replies under 300 characters."}]
+            resp = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=few + history,
+                temperature=0.2
+            )
+            assistant_reply = resp.choices[0].message.content.strip()
 
-    # append & log
+    # append & log the assistant reply
     history.append({"role":"assistant","content":assistant_reply})
     save_history(sid, history)
     log_call_turn(sid, len(history)//2, us, assistant_reply, None)
 
+    # generate TTS and return
     vr = generate_and_play_tts(assistant_reply, sid, str(int(time.time())))
-    tw = str(vr); print("📤 process-recording TwiML:", tw)
+    tw = str(vr); print("📤 response TwiML:", tw)
     return Response(content=tw, media_type="application/xml")
 
 # ─── Dashboard endpoints ─────────────────────────────────────────────────────────
@@ -363,7 +420,8 @@ async def get_call_logs(limit: int = 100):
     rows = c.fetchall(); logs = []
     for r in rows:
         log = dict(zip(
-            ["id","call_sid","turn_number","user_text","assistant_reply","error_message","timestamp"], r
+            ["id","call_sid","turn_number","user_text","assistant_reply","error_message","timestamp"],
+            r
         ))
         c.execute("SELECT messages FROM conversations WHERE call_sid=?;", (log["call_sid"],))
         m = c.fetchone(); log["transcript"] = json.loads(m[0]) if m else []
@@ -376,7 +434,7 @@ async def get_call_logs(limit: int = 100):
             ["vaccine_type","patient_name","desired_date","booked_at"], b
         )) if b else None
         c.execute("""
-            SELECT from_number,from_city,from_state,from_zip,from_country
+            SELECT from_number, from_city, from_state, from_zip, from_country
             FROM call_metadata WHERE call_sid=?;
         """, (log["call_sid"],))
         md = c.fetchone()
@@ -384,14 +442,16 @@ async def get_call_logs(limit: int = 100):
             ["from_number","from_city","from_state","from_zip","from_country"], md
         )) if md else {}
         logs.append(log)
-    conn.close(); return JSONResponse({"logs": logs})
+    conn.close()
+    return JSONResponse({"logs": logs})
 
 @app.get("/api/calls")
 async def list_call_sids():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT call_sid FROM conversations;")
     sids = [r[0] for r in c.fetchall()]
-    conn.close(); return JSONResponse({"call_sids": sids})
+    conn.close()
+    return JSONResponse({"call_sids": sids})
 
 @app.get("/api/conversations/{call_sid}")
 async def get_conversation(call_sid: str):
